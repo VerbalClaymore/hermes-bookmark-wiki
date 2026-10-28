@@ -1,0 +1,9 @@
+[project]
+name = "bookmark-wiki"
+version = "0.1.0"
+description = "Offline allowlisted bookmark archive and retrieval prototype"
+requires-python = ">=3.11"
+dependencies = []
+
+[tool.bookmark_wiki]
+standard_library_only = true
