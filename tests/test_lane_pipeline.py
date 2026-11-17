@@ -115,6 +115,71 @@ class PipelineTests(unittest.TestCase):
         self.assertEqual(pipeline.status(self.vault)['statuses'], {'done': 1})
         self.assertEqual(pipeline.show(self.vault, 'x:1')['item']['stage'], 'deliver')
 
+    def test_keepsake_dry_run_resume_and_finality(self):
+        self.tweets(1)
+        self.bird.tweets[0]['media'] = [{'type': 'photo', 'url': 'https://pbs.twimg.com/a'}]
+        self.deps['fetch'] = lambda url, kind, maximum: SimpleNamespace(
+            ok=True, body=b'\x89PNG\r\n\x1a\nimage', final_url=url, reason='')
+        original = self.llm.json
+        def select(prompt, validator):
+            def change(result):
+                result.update(value='keepsake', wiki=False, bots=[])
+                validator(result)
+            return original(prompt, change)
+        self.llm.json = select
+        calls = []
+        def fake_keep(*args, **kwargs):
+            calls.append(True)
+            return {'files': ['/saved/file.png'], 'index': '/wiki/keepsakes.md'}
+        self.deps['keepsake'] = fake_keep
+        first = self.run_sync(dry_run=True)
+        self.assertEqual(first['items'][0]['status'], 'pending')
+        self.assertFalse(calls)
+        self.assertNotIn('write', pipeline.show(self.vault, 'x:1')['artifacts'])
+        second = self.run_sync(capture=False)
+        self.assertEqual(second['items'][0]['status'], 'kept')
+        self.assertEqual(len(calls), 1)
+        artifact = pipeline.show(self.vault, 'x:1')['artifacts']['deliver']
+        self.assertEqual(artifact, {'wiki': None, 'bots': [], 'keepsake': {'files': ['/saved/file.png'], 'index': '/wiki/keepsakes.md'}})
+        self.assertIn('/saved/file.png', Path(second['report']).read_text())
+        self.assertEqual(self.run_sync(capture=False)['items'], [])
+        self.assertEqual(len(calls), 1)
+
+    def test_catch_up_wiring(self):
+        with patch('bookmark_wiki.lane.pipeline.capture_module.capture', return_value=[]) as capture:
+            self.run_sync(catch_up=True)
+            self.assertTrue(capture.call_args.kwargs['catch_up'])
+            self.assertIsNone(capture.call_args.kwargs['capture_count'])
+            self.run_sync(catch_up=True, capture_count=17)
+            self.assertEqual(capture.call_args.kwargs['capture_count'], 17)
+
+    def test_keepsake_download_failure_is_retried(self):
+        self.tweets(1)
+        self.bird.tweets[0]['media'] = [{'type': 'photo', 'url': 'https://pbs.twimg.com/a'}]
+        self.deps['fetch'] = lambda url, kind, maximum: SimpleNamespace(
+            ok=False, reason='fake download failure', final_url=url, body=b'')
+        original = self.llm.json
+        def select(prompt, validator):
+            def change(result):
+                result.update(value='keepsake', wiki=False, bots=[])
+                validator(result)
+            return original(prompt, change)
+        self.llm.json = select
+        failed = self.run_sync()['items'][0]
+        self.assertEqual(failed['status'], 'failed')
+        self.assertTrue(failed['error'].startswith('KEEPSAKE_FAILED:'))
+        self.deps['fetch'] = lambda url, kind, maximum: SimpleNamespace(
+            ok=True, body=b'\x89PNG\r\n\x1a\nimage', final_url=url, reason='')
+        result = self.run_sync(capture=False)['items'][0]
+        self.assertEqual(result['status'], 'kept')
+        self.assertTrue(Path(result['delivery']['keepsake']['files'][0]).is_file())
+
+    def test_cli_catch_up_sync_only(self):
+        with patch('bookmark_wiki.lane.pipeline.sync', return_value={}) as sync:
+            with contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(cli.main(['lane', 'sync', '--vault', str(self.vault), '--catch-up']), 0)
+            self.assertTrue(sync.call_args.kwargs['catch_up'])
+
     def test_resume_after_resolve_without_bird(self):
         self.tweets(1)
         self.llm.fail_ids.add('1')
@@ -142,6 +207,24 @@ class PipelineTests(unittest.TestCase):
         self.bird.tweets[1]['createdAt'] = 'Sun Nov 15 12:00:00 +0000 2026'
         result = self.run_sync(limit=1)
         self.assertEqual([item['source_id'] for item in result['items']], ['x:1'])
+
+    def test_newer_than_filters_post_date_and_preserves_pending(self):
+        self.tweets(1, 2, 3, 4)
+        self.bird.tweets[0]['createdAt'] = '2026-11-15T23:59:59Z'
+        self.bird.tweets[1]['createdAt'] = '2026-11-16T00:00:00Z'
+        self.bird.tweets[2]['createdAt'] = '2026-11-15T20:00:00-05:00'
+        del self.bird.tweets[3]['createdAt']
+        result = self.run_sync(newer_than='2026-11-16')
+        self.assertEqual({item['source_id'] for item in result['items']}, {'x:2', 'x:3'})
+        for sid in ('x:1', 'x:4'):
+            item = pipeline.show(self.vault, sid)
+            self.assertEqual(item['item']['status'], 'pending')
+            self.assertEqual(item['item']['attempts'], 0)
+            self.assertEqual(set(item['artifacts']), {'capture'})
+        for invalid in ('2026-02-30', '2026-1-01', '', True):
+            with self.subTest(invalid=invalid), self.assertRaises(ValueError):
+                self.run_sync(newer_than=invalid)
+        self.assertEqual({item['source_id'] for item in self.run_sync(capture=False)['items']}, {'x:1', 'x:4'})
 
     def test_dry_run_writes_no_external_files_then_resumes(self):
         self.tweets(1)
@@ -186,8 +269,9 @@ class PipelineTests(unittest.TestCase):
         self.assertEqual(self.run_sync()['items'][0]['status'], 'done')
         prompts = [prompt for ident, prompt in self.llm.prompts if ident == '2']
         self.assertEqual(len(prompts), 2)
-        for prompt in prompts:
-            self.assertIn('BEGIN UNTRUSTED ALREADY COVERED BY\n"Useful example"', prompt)
+        self.assertIn('BEGIN UNTRUSTED PRIOR COVERAGE', prompts[0])
+        self.assertIn('Useful example', prompts[0])
+        self.assertIn('BEGIN UNTRUSTED RECENT NOTES', prompts[0])
 
     def test_capture_retry_with_capture_enabled(self):
         self.tweets(1)
@@ -195,6 +279,93 @@ class PipelineTests(unittest.TestCase):
         pipeline.retry(self.vault, 'x:1', from_stage='capture')
         self.assertEqual(self.run_sync()['items'][0]['status'], 'done')
         self.assertIn('read', self.bird.calls)
+
+    def test_duplicate_dry_run_resume_seen_again_and_retry(self):
+        self.deps['fetch'] = lambda url, kind, maximum: SimpleNamespace(ok=True, body=b'<p>' + b'x' * 250 + b'</p>', final_url=url, reason='')
+        self.tweets(1)
+        self.bird.tweets[0]['text'] += ' https://example.test/shared'
+        self.assertEqual(self.run_sync()['items'][0]['status'], 'done')
+        self.tweets(2)
+        self.bird.tweets[0]['text'] += ' https://example.test/shared'
+        original = self.llm.json
+        def duplicate(prompt, validator):
+            def change(result):
+                if 'triaging a saved bookmark' in prompt:
+                    result.update(novelty='duplicate', duplicate_of='x:1', wiki=False, bots=[])
+                validator(result)
+            return original(prompt, change)
+        self.llm.json = duplicate
+        item = self.run_sync(dry_run=True)['items'][0]
+        self.assertEqual(item['status'], 'pending')
+        self.assertEqual(pipeline.show(self.vault, 'x:2')['item']['stage'], 'triage')
+        item = self.run_sync(capture=False)['items'][0]
+        self.assertEqual(item['status'], 'duplicate')
+        self.assertEqual(item['delivery'], {'wiki': None, 'bots': [], 'duplicate_of': 'x:1'})
+        self.assertNotIn('write', pipeline.show(self.vault, 'x:2')['artifacts'])
+        note = Path(item['seen_again_path'])
+        self.assertIn('[@a](https://x.com/a/status/2)', note.read_text())
+        self.assertIn('Duplicate of: Useful example (x:1)', Path(self.run_sync(capture=False)['report']).read_text())
+        pipeline.retry(self.vault, 'x:2', from_stage='triage')
+        self.assertEqual(self.run_sync(capture=False)['items'][0]['status'], 'duplicate')
+        self.assertEqual(note.read_text().count('Seen again:'), 1)
+
+    def test_duplicate_becomes_partial_if_prior_is_no_longer_done(self):
+        self.deps['fetch'] = lambda url, kind, maximum: SimpleNamespace(ok=True, body=b'<p>' + b'x' * 250 + b'</p>', final_url=url, reason='')
+        self.tweets(1)
+        self.bird.tweets[0]['text'] += ' https://example.test/shared'
+        self.assertEqual(self.run_sync()['items'][0]['status'], 'done')
+        self.tweets(2)
+        self.bird.tweets[0]['text'] += ' https://example.test/shared'
+        original = self.llm.json
+        def duplicate(prompt, validator):
+            def change(result):
+                if 'triaging a saved bookmark' in prompt:
+                    result.update(novelty='duplicate', duplicate_of='x:1', wiki=False, bots=[])
+                validator(result)
+            return original(prompt, change)
+        self.llm.json = duplicate
+        self.assertEqual(self.run_sync(dry_run=True)['items'][0]['status'], 'pending')
+        state = Store(self.vault, clock=lambda: self.now)
+        state.db.execute("UPDATE items SET status='pending', attempts=99 WHERE source_id='x:1'")
+        state.db.commit()
+        state.close()
+        item = self.run_sync(capture=False)['items'][0]
+        self.assertEqual(item['status'], 'done')
+        self.assertEqual(item['triage']['novelty'], 'partial')
+        self.assertTrue(item['triage']['wiki'])
+
+    def test_partial_pipeline_links_and_ledger_sources(self):
+        self.tweets(1)
+        first = self.run_sync()['items'][0]
+        self.assertEqual(first['status'], 'done')
+        state = Store(self.vault, clock=lambda: self.now)
+        old_note = state.read_artifact('1', 'write')
+        old_note['key_points'].append('Unique previous detail ' + 'z' * 400)
+        state.write_artifact('1', 'write', old_note)
+        state.close()
+        self.tweets(2)
+        original = self.llm.json
+        def partial(prompt, validator):
+            def change(result):
+                if 'triaging a saved bookmark' in prompt:
+                    result.update(novelty='partial', duplicate_of='x:1')
+                else:
+                    result['title'] = 'Increment'
+                validator(result)
+            return original(prompt, change)
+        self.llm.json = partial
+        item = self.run_sync()['items'][0]
+        self.assertEqual(item['status'], 'done')
+        self.assertIn('Builds on: [Useful example](Bookmark_1_useful-example.md)', Path(item['delivery']['wiki']['path']).read_text())
+        reference = Path(item['delivery']['bots'][0]['reference_path'])
+        self.assertIn('Builds on: [Useful example](1-useful-example.md)', reference.read_text())
+        prompt = [p for ident, p in self.llm.prompts if ident == '2' and 'triaging a saved bookmark' not in p][0]
+        self.assertIn('Point [1].', prompt)
+        self.assertIn('Unique previous detail ' + 'z' * 400, prompt)
+        self.assertIn('BEGIN UNTRUSTED PRIOR COVERAGE', prompt)
+        sources = (reference.parent.parent / 'sources.md').read_text()
+        self.assertIn('- https://x.com/i/status/1\n', sources)
+        self.assertIn('- https://x.com/i/status/2\n', sources)
 
     def test_invalid_resolve_discards_dependent_artifacts(self):
         self.tweets(1)

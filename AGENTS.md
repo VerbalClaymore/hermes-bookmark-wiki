@@ -24,7 +24,9 @@ Full operating guide, other commands and troubleshooting:
 
 ## Hard rules
 
-- X access is read only. Never post, like, follow or unbookmark.
+- X access is read only. Never post, like, follow or unbookmark. Never run
+  `lane unbookmark`: it removes bookmarks from the owner's X account and is
+  for the owner alone, by hand, in their own terminal.
 - Never copy or print browser cookies or other credentials.
 - Never edit a bot's `SOUL.md` or `memories/`.
 - Do not touch the older archive in the vault (`manifest.json`, `raw/`,

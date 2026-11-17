@@ -30,9 +30,20 @@ def append(vault: Path, entries: list[dict], clock=store.utc_now) -> Path:
         found = entry.get("where_found") or triage.get("core", {}).get("where_found")
         if found:
             lines.append("- Found in: " + _text(found))
+        earlier_id = triage.get("duplicate_of") or delivery.get("duplicate_of")
+        earlier_title = entry.get("earlier_title")
+        if earlier_id and earlier_title:
+            if triage.get("novelty") == "duplicate" or delivery.get("duplicate_of"):
+                lines.append("- Duplicate of: " + _text(earlier_title) + " (" + _text(earlier_id) + ")")
+            elif triage.get("novelty") == "partial":
+                lines.append("- Builds on: " + _text(earlier_title))
+        if entry.get("seen_again_path"):
+            lines.append("- Seen again: " + _text(entry["seen_again_path"]))
         wiki = delivery.get("wiki")
         if wiki:
             lines.append("- Wiki: " + _text(wiki.get("path", "")))
+        for saved in (delivery.get("keepsake") or {}).get("files", []):
+            lines.append("- Saved file: " + _text(saved))
         for bot in delivery.get("bots", []):
             line = "- Bot: " + _text(bot.get("profile", "")) + " / " + _text(bot.get("topic_slug", ""))
             if bot.get("reference_path"):

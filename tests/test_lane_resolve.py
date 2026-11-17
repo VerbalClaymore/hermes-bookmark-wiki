@@ -244,6 +244,15 @@ class ResolveTests(unittest.TestCase):
         self.assertEqual(link['kind'], 'x_status')
         self.assertEqual(link['text'], 'linked content')
 
+    def test_bracketed_and_malformed_links_do_not_fail_item(self):
+        # Real case: quoted text "[https://reference-site.com]." raised
+        # "Invalid IPv6 URL" and failed the whole bookmark.
+        text = ('see [https://example.com/a]. and (https://example.com/b), '
+                'also {https://example.com/c} and https://[bad')
+        result = self.resolve(tweet(text=text))
+        urls = [link['url'] for link in result['links']]
+        self.assertEqual(urls, ['https://example.com/a', 'https://example.com/b', 'https://example.com/c'])
+
     def test_pdf_not_read_and_arxiv_rewrite(self):
         pdf = 'https://example.com/file.pdf'
         arxiv = 'https://arxiv.org/pdf/1234.5678.pdf'

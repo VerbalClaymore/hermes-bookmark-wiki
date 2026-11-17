@@ -74,5 +74,24 @@ class WriteTests(unittest.TestCase):
         answers.extend(["{}", "{}"])
         with self.assertRaisesRegex(LLMError, "LLM_INVALID_JSON"): write(self.bundle, {}, llm)
 
+    def test_partial_prompt_uses_coverage_or_recent(self):
+        calls = []
+        def run(argv, **kwargs):
+            calls.append(argv[-1])
+            return SimpleNamespace(returncode=0, stdout=json.dumps(self.note))
+        model = LLM({'argv': ['fake'], 'timeout_s': 1}, run)
+        prior = {'coverage': {'notes': [{'source_id': 'x:1', 'title': 'Earlier', 'short_answer': 'Old answer', 'key_points': ['Old point']}]}, 'recent': []}
+        selection = {'novelty': 'partial', 'duplicate_of': 'x:1'}
+        write(self.bundle, selection, model, prior)
+        for text in ('BEGIN UNTRUSTED PRIOR COVERAGE', 'Earlier', 'Old answer', 'Old point', 'Write ONLY', 'first sentence', 'title must differ'):
+            self.assertIn(text, calls[-1])
+        prior['recent'] = prior['coverage']['notes']
+        prior['coverage']['notes'] = []
+        write(self.bundle, selection, model, prior)
+        self.assertIn('Old point', calls[-1])
+        write(self.bundle, {'novelty': 'new'}, model, prior)
+        self.assertNotIn('PRIOR COVERAGE', calls[-1])
+        self.assertNotIn('ALREADY COVERED BY', calls[-1])
+
 
 if __name__ == "__main__": unittest.main()

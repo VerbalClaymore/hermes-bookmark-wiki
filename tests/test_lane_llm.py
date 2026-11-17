@@ -68,6 +68,42 @@ class LLMTests(unittest.TestCase):
         self.assertEqual(bundle["limits"][0]["scope"], "llm_prompt")
         self.assertIn("truncated", prompt)
 
+    def test_multiple_blocks_priority_and_evidence_limit(self):
+        bundle = {'limits': [], 'text': 'e' * 50000}
+        blocks = [('BUNDLE', bundle), ('ROSTER', 'r' * 30000),
+                  ('WIKI TITLES', 'w' * 30000), ('RECENT NOTES', 'n' * 30000)]
+        order = ['RECENT NOTES', 'WIKI TITLES', 'PRIOR COVERAGE', 'ROSTER', 'BUNDLE']
+        prompt = prompt_with_data('instructions', blocks, bundle, priority=order)
+        self.assertLessEqual(len(prompt), 90000)
+        self.assertIn('"text":"' + 'e' * 50000 + '"', prompt)
+        self.assertIn('BEGIN UNTRUSTED RECENT NOTES\n[TRUNCATED', prompt)
+        self.assertIn('BEGIN UNTRUSTED WIKI TITLES\n', prompt)
+        self.assertEqual(bundle['limits'], [])
+        prompt = prompt_with_data('i', [('BUNDLE', {'text': 'b' * 100000})], bundle, priority=order)
+        self.assertLessEqual(len(prompt), 90000)
+        self.assertEqual(bundle['limits'][0]['scope'], 'llm_prompt')
+        prompt_with_data('i', [('BUNDLE', {'text': 'b' * 100000})], bundle, priority=order)
+        self.assertEqual(len(bundle['limits']), 1)
+
+    def test_multiple_blocks_default_and_fixed_instruction_boundary(self):
+        blocks = [('A', 'a' * 30000), ('B', 'b' * 30000), ('C', 'c' * 30000)]
+        prompt = prompt_with_data('i' * 30000, blocks)
+        self.assertLessEqual(len(prompt), 90000)
+        self.assertGreaterEqual(prompt.count('[TRUNCATED'), 2)
+        self.assertEqual(prompt_with_data('i' * 90000, [('A', 'x')]), 'i' * 90000)
+        with self.assertRaises(LLMError):
+            prompt_with_data('i' * 90001, [])
+
+    def test_direct_guard_trims_multiple_blocks(self):
+        self.answers = ['ok']
+        prompt = 'instructions\n' + '\n'.join(
+            'BEGIN UNTRUSTED ' + name + '\n' + name * 40000 + '\nEND UNTRUSTED ' + name
+            for name in ('A', 'B', 'C', 'D'))
+        self.assertEqual(self.llm.text(prompt), 'ok')
+        sent = self.calls[-1][0][-1]
+        self.assertLessEqual(len(sent), 100000)
+        self.assertGreaterEqual(sent.count('[TRUNCATED'), 2)
+
     def test_direct_large_prompt_and_retry_diagnostic_are_safe(self):
         self.answers = ["done"]
         prompt = "BEGIN UNTRUSTED BODY\n" + "x" * 110000 + "\nEND UNTRUSTED BODY"

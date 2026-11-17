@@ -2,17 +2,17 @@
 from __future__ import annotations
 
 import json
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from email.utils import parsedate_to_datetime
 from pathlib import Path
 import re
 import shutil
 import subprocess
 import sys
-from urllib.parse import urlsplit
+
 
 from . import bird as bird_module, capture as capture_module, config as config_module
-from . import deliver, llm as llm_module, report, resolve, store as store_module, triage, write
+from . import deliver, keepsake, ledger, llm as llm_module, report, resolve, store as store_module, triage, write
 
 
 def default_deps(config):
@@ -21,7 +21,7 @@ def default_deps(config):
     return {'bird': bird_module.Bird(config['bird']), 'llm': model,
             'fetch': resolve.make_fetch(config), 'vision': model.vision,
             'bot_runner': subprocess.run, 'clock': store_module.utc_now,
-            'which': shutil.which, 'run': subprocess.run}
+            'which': shutil.which, 'run': subprocess.run, 'keepsake': keepsake.keep}
 
 
 def _deps(config, overrides):
@@ -72,39 +72,23 @@ def _artifact(store, ident, stage, context):
                 or not isinstance(obj.get('signals'), dict)):
             raise ValueError('invalid resolve artifact')
     elif stage == 'triage':
-        triage.validate(obj, {p['id'] for p in context['roster']})
+        triage.validate(obj, {p['id'] for p in context['roster']}, has_media=bool(context['resolve'].get('media')))
+        if obj.get('novelty') == 'duplicate':
+            earlier = store.db.execute("SELECT 1 FROM items WHERE source_id=? AND status='done'", (obj['duplicate_of'],)).fetchone()
+            if earlier:
+                triage.validate(obj, {p['id'] for p in context['roster']}, has_media=bool(context['resolve'].get('media')),
+                                prior=context['prior'], source_id=context['resolve']['source_id'])
     elif stage == 'write':
         write.validate(obj, context['resolve'])
     elif stage == 'deliver':
-        if set(obj) != {'wiki', 'bots'} or not isinstance(obj['bots'], list) or not (obj['wiki'] is None or isinstance(obj['wiki'], dict)):
+        if (set(obj) not in ({'wiki', 'bots'}, {'wiki', 'bots', 'keepsake'}, {'wiki', 'bots', 'duplicate_of'})
+                or not isinstance(obj['bots'], list) or not (obj['wiki'] is None or isinstance(obj['wiki'], dict))
+                or ('duplicate_of' in obj and (obj['wiki'] is not None or obj['bots'] or not isinstance(obj['duplicate_of'], str) or not obj['duplicate_of']))
+                or ('keepsake' in obj and (obj['wiki'] is not None or obj['bots'] or not isinstance(obj['keepsake'], dict)
+                    or set(obj['keepsake']) != {'files', 'index'} or not isinstance(obj['keepsake']['files'], list)
+                    or not all(isinstance(p, str) for p in obj['keepsake']['files']) or not isinstance(obj['keepsake']['index'], str)))):
             raise ValueError('invalid delivery artifact')
     return obj
-
-
-def _evidence(bundle):
-    links = [x for x in bundle.get('links', [])
-             if x.get('status') == 'ok' and x.get('final_url')]
-    keys = {'url:' + links[0]['final_url']} if links else set()
-    for link in links:
-        parsed = urlsplit(link['final_url'])
-        parts = parsed.path.strip('/').split('/')
-        if link.get('kind') == 'github_repo' and (parsed.hostname or '').lower() == 'github.com' and len(parts) >= 2:
-            keys.add('github:' + '/'.join(parts[:2]).lower().removesuffix('.git'))
-    return keys
-
-
-def _covered_by(store, bundle):
-    keys = _evidence(bundle)
-    if not keys:
-        return None
-    for row in store.db.execute("SELECT tweet_id FROM items WHERE status = 'done' ORDER BY updated_at DESC"):
-        try:
-            other = store.read_artifact(row['tweet_id'], 'resolve')
-            if keys & _evidence(other):
-                return store.read_artifact(row['tweet_id'], 'write')['title']
-        except (OSError, ValueError, KeyError, TypeError):
-            continue
-    return None
 
 
 def _error(exc, stage):
@@ -131,7 +115,15 @@ def _timestamp(value):
         return 0.0
 
 
-def sync(vault, *, limit=None, capture_count=None, capture=True, bot_runs=True, dry_run=False, deps=None):
+def sync(vault, *, limit=None, capture_count=None, capture=True, bot_runs=True, dry_run=False, catch_up=False, newer_than=None, deps=None):
+    cutoff = None
+    if newer_than is not None:
+        if not isinstance(newer_than, str) or not re.fullmatch(r'\d{4}-\d{2}-\d{2}', newer_than):
+            raise ValueError('newer_than must be a valid YYYY-MM-DD date')
+        try:
+            cutoff = datetime.combine(date.fromisoformat(newer_than), datetime.min.time(), tzinfo=timezone.utc).timestamp()
+        except ValueError as exc:
+            raise ValueError('newer_than must be a valid YYYY-MM-DD date') from exc
     vault = Path(vault).absolute()
     cfg = config_module.load(vault)
     if limit is not None and (type(limit) is not int or limit < 1):
@@ -146,19 +138,26 @@ def sync(vault, *, limit=None, capture_count=None, capture=True, bot_runs=True, 
     state = store_module.Store(vault, clock=d['clock'])
     try:
         with state.locked():
+            ledger.ensure(state)
             capture_metadata = {}
-            captured = capture_module.capture(vault, state, cfg, d['bird'], metadata=capture_metadata) if capture else []
+            captured = capture_module.capture(vault, state, cfg, d['bird'], metadata=capture_metadata,
+                                              catch_up=catch_up, capture_count=capture_count) if capture else []
             rows = [dict(row) for row in state.db.execute(
                 "SELECT * FROM items WHERE status IN ('pending', 'failed') AND attempts < ?",
                 (cfg['limits']['max_attempts'],))]
-            def newest(row):
+            def post_date(row):
                 try:
                     obj = state.read_artifact(row['tweet_id'], 'capture')
-                    dates = [_timestamp(t.get('createdAt')) for t in obj.get('tweets', []) if isinstance(t, dict)]
-                    return (max(dates, default=0.0) or _timestamp(row['created_at']), int(row['tweet_id']))
+                    post = next((t for t in obj.get('tweets', []) if isinstance(t, dict)
+                                 and str(t.get('id')) == row['tweet_id']), None)
+                    return _timestamp(post.get('createdAt')) if post else 0.0
                 except (OSError, ValueError, TypeError):
-                    return (_timestamp(row['created_at']), int(row['tweet_id']))
-            rows.sort(key=newest, reverse=True)
+                    return 0.0
+            dated = [(row, post_date(row)) for row in rows]
+            if cutoff is not None:
+                dated = [(row, timestamp) for row, timestamp in dated if timestamp and timestamp >= cutoff]
+            dated.sort(key=lambda pair: (pair[1] or _timestamp(pair[0]['created_at']), int(pair[0]['tweet_id'])), reverse=True)
+            rows = [row for row, _ in dated]
             entries = []
             for row in rows[:maximum]:
                 ident, source_id = row['tweet_id'], row['source_id']
@@ -168,6 +167,8 @@ def sync(vault, *, limit=None, capture_count=None, capture=True, bot_runs=True, 
                 try:
                     ctx['roster'] = triage.roster(cfg)
                     for stage in store_module.STAGES:
+                        if stage == 'write' and ctx['triage']['value'] == 'keepsake':
+                            continue
                         if stage == 'deliver' and dry_run:
                             break
                         print(f'{source_id} {stage} started', file=sys.stderr, flush=True)
@@ -179,7 +180,10 @@ def sync(vault, *, limit=None, capture_count=None, capture=True, bot_runs=True, 
                             index = store_module.STAGES.index(stage)
                             for later in store_module.STAGES[index:]:
                                 state.artifact(ident, later).unlink(missing_ok=True)
-                            _update(state, source_id, stage=store_module.STAGES[index - 1] if index else None)
+                            previous = store_module.STAGES[index - 1] if index else None
+                            if stage == 'deliver' and ctx['triage']['value'] == 'keepsake':
+                                previous = 'triage'
+                            _update(state, source_id, stage=previous)
                             if stage == 'capture':
                                 tweet = d['bird'].json('read', [ident, '--json'],
                                                        profile=cfg['bird']['read_profile'])
@@ -196,24 +200,84 @@ def sync(vault, *, limit=None, capture_count=None, capture=True, bot_runs=True, 
                             elif stage == 'triage':
                                 try:
                                     obj = triage.triage(ctx['resolve'], ctx['roster'], deliver.lane_wiki_titles(vault),
-                                                        d['llm'], covered_by=_covered_by(state, ctx['resolve']))
+                                                        d['llm'], prior=ctx['prior'])
                                 finally:
                                     store_module.atomic_json(state.artifact(ident, 'resolve'), ctx['resolve'])
                             elif stage == 'write':
                                 try:
-                                    obj = write.write(ctx['resolve'], ctx['triage'], d['llm'],
-                                                      covered_by=_covered_by(state, ctx['resolve']))
+                                    earlier_note = None
+                                    if ctx['triage'].get('novelty') == 'partial':
+                                        earlier_id = ctx['triage']['duplicate_of']
+                                        earlier_row = _row(state, earlier_id)
+                                        artifact = state.read_artifact(earlier_row['tweet_id'], 'write')
+                                        earlier_note = {'source_id': earlier_id, **{key: artifact[key] for key in ('title', 'short_answer', 'key_points')}}
+                                    obj = write.write(ctx['resolve'], ctx['triage'], d['llm'], prior=ctx['prior'], earlier_note=earlier_note)
                                 finally:
                                     store_module.atomic_json(state.artifact(ident, 'resolve'), ctx['resolve'])
                             else:
-                                obj = deliver.deliver(state.item_dir(ident), ctx['resolve'], ctx['triage'], ctx['write'],
-                                                      cfg, vault, bot_runner=d['bot_runner'], clock=d['clock'], bot_runs=bot_runs)
+                                if ctx['triage']['value'] == 'keepsake':
+                                    saved = d['keepsake'](state.item_dir(ident), ctx['capture'], ctx['resolve'], ctx['triage'],
+                                                          cfg, vault, fetch=d['fetch'], run=d['run'], which=d['which'], clock=d['clock'])
+                                    obj = {'wiki': None, 'bots': [], 'keepsake': saved}
+                                else:
+                                    builds_on = None
+                                    if ctx['triage'].get('novelty') == 'partial':
+                                        earlier_id = ctx['triage']['duplicate_of']
+                                        earlier_row = _row(state, earlier_id)
+                                        earlier_note = state.read_artifact(earlier_row['tweet_id'], 'write')
+                                        try:
+                                            earlier_delivery = state.read_artifact(earlier_row['tweet_id'], 'deliver')
+                                        except (OSError, ValueError):
+                                            earlier_delivery = {}
+                                        builds_on = {'source_id': earlier_id, 'title': earlier_note['title'],
+                                                     'wiki_path': (earlier_delivery.get('wiki') or {}).get('path'),
+                                                     'references': {(b['profile'], b['topic_slug']): b['reference_path']
+                                                                    for b in earlier_delivery.get('bots', [])}}
+                                    obj = deliver.deliver(state.item_dir(ident), ctx['resolve'], ctx['triage'], ctx['write'],
+                                                          cfg, vault, bot_runner=d['bot_runner'], clock=d['clock'], bot_runs=bot_runs,
+                                                          builds_on=builds_on, sources=lambda profile, topic: ledger.topic_sources(state, profile, topic))
                             state.write_artifact(ident, stage, obj)
                         ctx[stage] = obj
+                        if stage == 'resolve':
+                            ctx['prior'] = {'coverage': ledger.prior_coverage(state, obj), 'recent': ledger.recent_notes(state)}
+                            entry['prior'] = ctx['prior']
                         print(f'{source_id} {stage} ok', file=sys.stderr, flush=True)
                         if stage in ('resolve', 'triage', 'write', 'deliver'):
                             entry[{'resolve': 'bundle', 'write': 'note', 'deliver': 'delivery'}.get(stage, stage)] = obj
                         if stage == 'triage':
+                            if obj.get('novelty') == 'duplicate':
+                                earlier_id = obj['duplicate_of']
+                                earlier = state.db.execute("SELECT * FROM items WHERE source_id=? AND status='done'", (earlier_id,)).fetchone()
+                                if earlier is None:
+                                    obj = dict(obj, novelty='partial', wiki=True, bots=[])
+                                    state.write_artifact(ident, 'triage', obj)
+                                    ctx['triage'] = entry['triage'] = obj
+                                elif dry_run:
+                                    _update(state, source_id, stage='triage', status='pending', error=None)
+                                    entry['status'] = 'pending'
+                                    break
+                                else:
+                                    previous_note = state.read_artifact(earlier['tweet_id'], 'write')
+                                    previous_delivery = state.read_artifact(earlier['tweet_id'], 'deliver')
+                                    wiki_path = (previous_delivery.get('wiki') or {}).get('path')
+                                    path = ledger.seen_again(vault, state.item_dir(ident), state, earlier_id, ctx['resolve'], d['clock'])
+                                    ledger.record(state, source_id, ctx['resolve'], title=previous_note['title'], takeaway=previous_note['short_answer'], wiki_path=wiki_path, bots=[], note_source_id=earlier_id, clock=d['clock'])
+                                    delivery_obj = {'wiki': None, 'bots': [], 'duplicate_of': earlier_id}
+                                    state.write_artifact(ident, 'deliver', delivery_obj)
+                                    _update(state, source_id, stage='deliver', status='duplicate', value=obj['value'], destinations_json=json.dumps({'wiki': False, 'bots': []}), error=None)
+                                    entry.update(status='duplicate', delivery=delivery_obj, seen_again_path=path, earlier_title=previous_note['title'])
+                                    break
+                            if obj.get('novelty') == 'partial':
+                                match = next((n for n in ctx['prior']['coverage']['notes'] + ctx['prior']['recent'] if n['source_id'] == obj['duplicate_of']), None)
+                                if match:
+                                    entry['earlier_title'] = match['title']
+                                else:
+                                    try:
+                                        earlier_row = _row(state, obj['duplicate_of'])
+                                        earlier_note = state.read_artifact(earlier_row['tweet_id'], 'write')
+                                        entry['earlier_title'] = earlier_note['title']
+                                    except (OSError, ValueError, KeyError, TypeError):
+                                        pass
                             destinations = {'wiki': obj['wiki'], 'bots': [b['profile'] for b in obj['bots']]}
                             _update(state, source_id, value=obj['value'], destinations_json=json.dumps(destinations))
                             if obj['value'] == 'skip':
@@ -222,10 +286,13 @@ def sync(vault, *, limit=None, capture_count=None, capture=True, bot_runs=True, 
                                 entry['status'] = status_value
                                 break
                     else:
-                        _update(state, source_id, stage='deliver', status='done', error=None)
-                        entry['status'] = 'done'
+                        final_status = 'kept' if ctx['triage']['value'] == 'keepsake' else 'done'
+                        if final_status == 'done':
+                            ledger.record(state, source_id, ctx['resolve'], title=ctx['write']['title'], takeaway=ctx['write']['short_answer'], wiki_path=(ctx['deliver'].get('wiki') or {}).get('path'), bots=[{k: b[k] for k in ('profile', 'topic_slug', 'reference_path')} for b in ctx['deliver']['bots']], clock=d['clock'])
+                        _update(state, source_id, stage='deliver', status=final_status, error=None)
+                        entry['status'] = final_status
                     if dry_run and 'status' not in entry:
-                        _update(state, source_id, stage='write', status='pending', error=None)
+                        _update(state, source_id, stage='triage' if ctx['triage']['value'] == 'keepsake' else 'write', status='pending', error=None)
                         entry['status'] = 'pending'
                 except Exception as exc:
                     error = _error(exc, stage)

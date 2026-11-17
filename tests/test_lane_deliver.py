@@ -9,7 +9,59 @@ import tempfile
 import unittest
 
 from bookmark_wiki.lane import config
-from bookmark_wiki.lane.deliver import deliver, lane_wiki_titles
+from bookmark_wiki.lane.deliver import _sources_text, deliver, lane_wiki_titles
+
+
+class SourcesTextTests(unittest.TestCase):
+    def row(self, key, source_id='x:1', title='First\nnote', takeaway='One\nlesson',
+            created_at='2026-01-01T00:00:00Z', reference_path='/tmp/first.md'):
+        return dict(key=key, source_id=source_id, title=title, takeaway=takeaway,
+                    created_at=created_at, reference_path=reference_path)
+
+    def test_sections_sorted_grouped_and_sources_deduplicated(self):
+        rows = [self.row('z:thing', source_id='x:2', title='Later', takeaway='Second',
+                         created_at='2026-02-01T00:00:00Z', reference_path='/tmp/second.md'),
+                self.row('z:thing'), self.row('x:123'), self.row('a:\nvalue'),
+                self.row('x:123'), self.row('https://x.com/i/status/123')]
+        self.assertEqual(_sources_text(rows),
+                         '# Sources already learned from\n\n'
+                         'This lists the sources this topic has already absorbed. The pipeline regenerates this file.\n\n'
+                         '## First note\n\n2026-01-01. One lesson ([reference](references/first.md))\n\n'
+                         '- a: value\n- https://x.com/i/status/123\n- z:thing\n\n'
+                         '## Later\n\n2026-02-01. Second ([reference](references/second.md))\n\n'
+                         '- z:thing\n\n')
+
+    def test_github_alias_matches_url_case_insensitively(self):
+        rows = [self.row(key) for key in ('github:OWNER/Repo', 'https://github.com/owner/REPO/tree/main',
+                                          'github:other/repo', 'https://github.com.evil/other/repo')]
+        text = _sources_text(rows)
+        self.assertNotIn('- github:OWNER/Repo\n', text)
+        self.assertIn('- https://github.com/owner/REPO/tree/main\n', text)
+        self.assertIn('- github:other/repo\n', text)
+
+    def test_arxiv_alias_matches_abs_and_pdf_urls(self):
+        for url in ('https://arxiv.org/abs/2401.12345', 'https://www.arxiv.org/pdf/2401.12345.pdf'):
+            with self.subTest(url=url):
+                text = _sources_text([self.row(key) for key in
+                                      ('arxiv:2401.12345', 'arxiv:2401.99999', url)])
+                self.assertNotIn('- arxiv:2401.12345\n', text)
+                self.assertIn('- arxiv:2401.99999\n', text)
+                self.assertIn('- ' + url + '\n', text)
+
+    def test_youtube_alias_matches_video_urls(self):
+        for url in ('https://youtu.be/AbC', 'https://www.youtube.com/watch?v=AbC',
+                    'https://m.youtube.com/shorts/AbC', 'https://youtube.com/embed/AbC'):
+            with self.subTest(url=url):
+                text = _sources_text([self.row(key) for key in ('yt:AbC', 'yt:abc', url)])
+                self.assertNotIn('- yt:AbC\n', text)
+                self.assertIn('- yt:abc\n', text)
+                self.assertIn('- ' + url + '\n', text)
+
+    def test_aliases_are_scoped_to_each_bookmark_and_other_keys_unchanged(self):
+        text = _sources_text([self.row('github:owner/repo'), self.row('x:not-digits'),
+                              self.row('https://github.com/owner/repo', source_id='x:2')])
+        self.assertIn('- github:owner/repo\n', text)
+        self.assertIn('- x:not-digits\n', text)
 
 
 class DeliveryTests(unittest.TestCase):
@@ -149,7 +201,7 @@ class DeliveryTests(unittest.TestCase):
         self.bundle = {'source_id': 'x:124'}
         self.note['title'] = 'Next'
         self.run_delivery()
-        self.assertEqual(skill.read_text().count('- ['), 2)
+        self.assertEqual(skill.read_text().count('- ['), 3)
         self.assertTrue(skill.read_text().startswith(text))
         self.assertEqual(old.read_bytes(), b'old lane\x00')
         self.assertTrue(list((self.item / 'backups').glob('SKILL.md.*.bak')))
@@ -197,6 +249,54 @@ class DeliveryTests(unittest.TestCase):
         self.assertIsNone(self.run_delivery(bot_runs=False)['bots'][0]['bot_run'])
         self.config['hermes']['bot_runs'] = False
         self.assertIsNone(self.run_delivery()['bots'][0]['bot_run'])
+
+    def test_partial_links_sources_regeneration_and_bot_prompt(self):
+        first = self.run_delivery()
+        old_wiki = first['wiki']['path']
+        old_ref = first['bots'][0]['reference_path']
+        skill = Path(old_ref).parent.parent / 'SKILL.md'
+        skill.write_text(skill.read_text().replace('- [Sources already learned from](sources.md)\n', ''))
+        self.bundle = {'source_id': 'x:124', 'links': [{'status': 'ok', 'final_url': 'https://example.test/new'}]}
+        self.note['title'] = 'Increment'
+        self.bot['relevance'] = 'high'
+        prior = [{'source_id': 'x:123', 'key': 'x:123', 'title': 'Useful Example', 'takeaway': 'Old',
+                  'created_at': '2026-01-01T00:00:00+00:00', 'reference_path': old_ref}]
+        builds = {'source_id': 'x:123', 'title': 'Useful Example', 'wiki_path': old_wiki,
+                  'references': {('bot', 'useful-topic'): old_ref}}
+        calls = []
+        def runner(argv, **kwargs):
+            calls.append(argv[-1])
+            return subprocess.CompletedProcess(argv, 0, stdout='NONE: no changes')
+        second = self.run_delivery(runner, builds_on=builds, sources=prior)
+        self.assertIn('# Increment\nBuilds on: [Useful Example](' + Path(old_wiki).name + ')', Path(second['wiki']['path']).read_text())
+        self.assertIn('# Increment\nBuilds on: [Useful Example](' + Path(old_ref).name + ')', Path(second['bots'][0]['reference_path']).read_text())
+        sources = (skill.parent / 'sources.md').read_text()
+        self.assertLess(sources.index('## Useful Example'), sources.index('## Increment'))
+        self.assertIn('2026-01-01. Old ([reference](references/' + Path(old_ref).name + '))', sources)
+        self.assertIn('2026-11-16. ', sources)
+        self.assertIn('- https://x.com/i/status/123', sources)
+        self.assertIn('- https://x.com/i/status/124', sources)
+        self.assertIn('https://example.test/new', sources)
+        self.assertEqual(skill.read_text().count('[Sources already learned from](sources.md)'), 1)
+        self.assertIn('sources.md', calls[0])
+        self.assertIn('do not re-add', calls[0])
+        self.assertIn('increment on "Useful Example"', calls[0])
+        Path(old_ref).unlink()
+        Path(old_wiki).unlink()
+        third = self.run_delivery(runner, builds_on=builds, sources=prior)
+        self.assertIn('Builds on: Useful Example\n', Path(third['wiki']['path']).read_text())
+        self.assertIn('Builds on: Useful Example\n', Path(third['bots'][0]['reference_path']).read_text())
+
+    def test_sources_symlink_is_rejected(self):
+        self.run_delivery()
+        sources = self.profile / 'skills/bookmarks/useful-topic/sources.md'
+        outside = self.vault / 'outside.md'
+        outside.write_text('safe')
+        sources.unlink()
+        sources.symlink_to(outside)
+        with self.assertRaises(ValueError):
+            self.run_delivery()
+        self.assertEqual(outside.read_text(), 'safe')
 
     def test_failed_run_still_restores_memory(self):
         self.bot['relevance'] = 'high'

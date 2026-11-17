@@ -18,7 +18,7 @@ DEFAULTS = {
         "vision_argv": ["hermes", "--ignore-rules", "-t", "", "-m", "gpt-6.1-terra", "chat", "-Q", "--oneshot", "--image", "{image}", "-q"],
     },
     "hermes": {"home": "/Users/vernon/.hermes", "exclude_profiles": ["default", "geoffrey"], "bot_runs": True, "bot_run_timeout_s": 600},
-    "limits": {"capture_count": 40, "links_per_item": 5, "link_bytes": 1500000, "link_chars_for_llm": 20000, "images_per_item": 4, "image_bytes": 8000000, "max_attempts": 3, "items_per_sync": 25},
+    "limits": {"capture_count": 40, "links_per_item": 5, "link_bytes": 1500000, "link_chars_for_llm": 20000, "images_per_item": 4, "image_bytes": 8000000, "keepsake_file_bytes": 300000000, "max_attempts": 3, "items_per_sync": 25},
     "media": {"max_video_seconds": 1200, "videos_per_item": 2, "frames_per_video": 4,
               "whisper_argv": ["/Users/vernon/whisper-venv/bin/whisper"],
               "whisper_model": "large-v3-turbo", "ffmpeg": "ffmpeg"},

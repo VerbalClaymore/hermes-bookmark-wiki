@@ -112,7 +112,18 @@ def validate(note: dict, bundle: dict) -> None:
         raise ValueError("note must be under 150 lines")
 
 
-def write(bundle, triage_result, llm, covered_by=None) -> dict:
-    prompt = prompt_with_data(WRITE_INSTRUCTIONS, [("BUNDLE", bundle), ("TRIAGE", triage_result),
-                              ("ALREADY COVERED BY", covered_by)], bundle)
+def write(bundle, triage_result, llm, prior=None, earlier_note=None) -> dict:
+    blocks = [("BUNDLE", bundle), ("TRIAGE", triage_result)]
+    instructions = WRITE_INSTRUCTIONS
+    if triage_result.get("novelty") == "partial":
+        prior = prior or {"coverage": {"notes": []}, "recent": []}
+        earlier = earlier_note if earlier_note is not None else next(
+            (n for n in prior["coverage"]["notes"] + prior["recent"]
+             if n["source_id"] == triage_result.get("duplicate_of")), None)
+        blocks.append(("PRIOR COVERAGE", earlier))
+        instructions += ("\nWrite ONLY what this bookmark adds beyond the earlier note. "
+                         "In the first sentence of the explanation say which earlier note it builds on, by title. "
+                         "Do not repeat the earlier note's points; the title must differ from the earlier title.\n")
+    prompt = prompt_with_data(instructions, blocks, bundle,
+                              priority=["PRIOR COVERAGE", "TRIAGE", "BUNDLE"])
     return llm.json(prompt, lambda note: validate(note, bundle))

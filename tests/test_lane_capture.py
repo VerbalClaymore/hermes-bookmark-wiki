@@ -142,6 +142,33 @@ class LaneCaptureTests(unittest.TestCase):
             bird.json('read', [], profile='p')
         self.assertTrue(bird.last_decode_repaired)
 
+    def test_bird_repairs_control_characters_in_json_values(self):
+        payload = [b'{"nested":["a\x00b", {"text":"\xff\x01\\n\\r\\t", "number":1}]}']
+        def run(argv, **kwargs):
+            kwargs['stdout'].write(payload[0])
+            return subprocess.CompletedProcess(argv, 0)
+        bird = Bird(self.config['bird'], runner=run)
+        self.assertEqual(bird.json('read', [], profile='p'),
+                         {'nested': ['a\ufffdb', {'text': '\ufffd\ufffd\n\r\t', 'number': 1}]})
+        self.assertTrue(bird.last_decode_repaired)
+        self.assertEqual(bird.decode_repaired_count, 1)
+
+        payload[0] = b'{"text":"a\x00b"}'
+        self.assertEqual(bird.json('read', [], profile='p'), {'text': 'a\ufffdb'})
+        self.assertTrue(bird.last_decode_repaired)
+        self.assertEqual(bird.decode_repaired_count, 2)
+
+        payload[0] = b'{"text":"clean\\u0000"}'
+        self.assertEqual(bird.json('read', [], profile='p'), {'text': 'clean\x00'})
+        self.assertFalse(bird.last_decode_repaired)
+        self.assertEqual(bird.decode_repaired_count, 2)
+
+        payload[0] = b'{"text":"a\x00b",}'
+        with self.assertRaisesRegex(BirdError, 'BIRD_FAILED: invalid Bird JSON'):
+            bird.json('read', [], profile='p')
+        self.assertFalse(bird.last_decode_repaired)
+        self.assertEqual(bird.decode_repaired_count, 2)
+
     def test_page_shapes_cursor_and_group_count(self):
         self.config['limits']['capture_count'] = 3
         pages = [
@@ -186,6 +213,49 @@ class LaneCaptureTests(unittest.TestCase):
         bird = PageBird([{'tweets': [{'id': str(1000 + i)}], 'nextCursor': str(i)} for i in range(61)])
         self.assertEqual(len(capture(self.vault, self.store, self.config, bird)), 60)
         self.assertEqual(len(bird.calls), 60)
+
+    def test_catch_up_passes_lane_pages_and_stops_at_archive(self):
+        (self.vault / 'manifest.json').write_text(json.dumps({'sources': {'x:82': {}, 'x:90': {}}}))
+        capture(self.vault, self.store, self.config, PageBird([[{'id': '70'}]]))
+        pages = [
+            {'tweets': [{'id': '70'}], 'nextCursor': 'a'},
+            {'tweets': [{'id': '80'}, {'id': '82', 'threadRootId': '81'}], 'nextCursor': 'b'},
+            {'tweets': [{'id': '90'}], 'nextCursor': 'c'},
+        ]
+        normal = PageBird(copy.deepcopy(pages))
+        self.assertEqual(capture(self.vault, self.store, self.config, normal), [])
+        self.assertEqual(len(normal.calls), 1)
+        metadata = {}
+        bird = PageBird(copy.deepcopy(pages))
+        self.assertEqual(capture(self.vault, self.store, self.config, bird,
+                                 catch_up=True, metadata=metadata), ['x:80'])
+        self.assertEqual(len(bird.calls), 3)
+        self.assertEqual(metadata['archive_seen'], 2)
+        self.assertFalse(self.store.artifact('81', 'capture').exists())
+        self.assertFalse(self.store.artifact('90', 'capture').exists())
+
+    def test_catch_up_default_and_explicit_count(self):
+        self.config['limits']['capture_count'] = 1
+        pages = [{'tweets': [{'id': '101'}], 'nextCursor': 'a'},
+                 {'tweets': [{'id': '102'}]}]
+        bird = PageBird(copy.deepcopy(pages))
+        self.assertEqual(capture(self.vault, self.store, self.config, bird, catch_up=True),
+                         ['x:101', 'x:102'])
+        bird = PageBird(copy.deepcopy(pages))
+        self.assertEqual(capture(self.vault, self.store, self.config, bird,
+                                 catch_up=True, capture_count=1), [])
+        self.assertEqual(len(bird.calls), 1)
+        with self.assertRaises(ValueError):
+            capture(self.vault, self.store, self.config, PageBird([]), capture_count=0)
+
+    def test_archive_seen_counts_unique_processed_groups(self):
+        (self.vault / 'manifest.json').write_text(json.dumps({'sources': {'x:201': {}, 'x:202': {}}}))
+        bird = PageBird([{'tweets': [{'id': '201'}, {'id': '203'}], 'nextCursor': 'a'},
+                         {'tweets': [{'id': '201'}, {'id': '202'}]}])
+        metadata = {}
+        self.assertEqual(capture(self.vault, self.store, self.config, bird,
+                                 catch_up=True, metadata=metadata), ['x:203'])
+        self.assertEqual(metadata['archive_seen'], 2)
 
     def test_page_failure_preserves_prior_and_first_page_fails(self):
         for failure in (BirdError('BIRD_FAILED: synthetic failure'), {'tweets': 'invalid'},

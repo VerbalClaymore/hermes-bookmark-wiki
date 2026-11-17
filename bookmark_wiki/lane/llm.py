@@ -41,38 +41,42 @@ def extract_json(text: str) -> dict:
 
 
 def prompt_with_data(instructions: str, blocks: list[tuple[str, object]],
-                     bundle: dict | None = None) -> str:
-    """Serialize untrusted blocks safely and record any prompt-size truncation.
-
-    Truncate the largest whole serialized block, preserving explicit delimiters.
-    The model sees that the contents are incomplete; the bundle retains the limit.
-    """
+                     bundle: dict | None = None, priority=None) -> str:
+    """Serialize untrusted data and trim context before evidence when requested."""
+    if len(instructions) > 90000:
+        raise LLMError("LLM_FAILED: prompt instructions exceed size limit")
     rendered = [(name, json.dumps(data, ensure_ascii=True, separators=(",", ":")))
                 for name, data in blocks]
 
     def assemble():
-        return instructions + "\n" + "\n".join(
+        return instructions + ("\n" if rendered else "") + "\n".join(
             f"BEGIN UNTRUSTED {name}\n{data}\nEND UNTRUSTED {name}"
             for name, data in rendered)
 
     prompt = assemble()
-    truncated = False
-    # Leave space for a validation error on the retry.
+    truncated = set()
+    marker = '[TRUNCATED: untrusted content truncated]'
     while len(prompt) > 90000:
-        index = max(range(len(rendered)), key=lambda i: len(rendered[i][1]))
+        candidates = [i for i, (_, data) in enumerate(rendered) if data != marker]
+        candidates = candidates or list(range(len(rendered)))
+        if priority is None:
+            index = max(candidates, key=lambda i: len(rendered[i][1]))
+        else:
+            index = min(candidates, key=lambda i: (priority.index(rendered[i][0])
+                        if rendered[i][0] in priority else len(priority), i))
         name, data = rendered[index]
         excess = len(prompt) - 90000
-        if len(data) <= excess + 64:
-            raise LLMError("LLM_FAILED: prompt instructions exceed size limit")
-        rendered[index] = (name, data[:len(data) - excess - 64] +
-                           ' [TRUNCATED: untrusted content omitted]')
-        truncated = True
+        if len(data) > len(marker):
+            keep = max(0, len(data) - excess - len(marker))
+            rendered[index] = (name, data[:keep] + marker)
+        else:
+            rendered.pop(index)
+        truncated.add(name)
         prompt = assemble()
-    if truncated:
+    if 'BUNDLE' in truncated:
         limit = {"scope": "llm_prompt", "reason": "Untrusted prompt content was truncated"}
         if bundle is not None and limit not in bundle.setdefault("limits", []):
             bundle["limits"].append(limit)
-        prompt += "\nLimit: Untrusted prompt content was truncated.\n"
     return prompt
 
 
@@ -85,19 +89,24 @@ class LLM:
         if len(prompt) > 100000:
             pattern = r"(?ms)^BEGIN UNTRUSTED ([^\n]+)\n(.*?)\nEND UNTRUSTED \1$"
             notice = "\nLimit: Untrusted prompt content was truncated.\n"
-            while len(prompt) + len(notice) > 100000:
+            fixed = re.sub(pattern, '', prompt)
+            target = 100000 - len(notice) if len(fixed) <= 100000 - len(notice) else 100000
+            while len(prompt) > target:
                 matches = list(re.finditer(pattern, prompt))
                 if not matches:
                     raise LLMError("LLM_FAILED: prompt exceeds 100000 characters")
-                largest = max(matches, key=lambda match: len(match.group(2)))
+                marker = "[TRUNCATED: untrusted content omitted]"
+                candidates = [match for match in matches if len(match.group(2)) > len(marker)] or matches
+                largest = max(candidates, key=lambda match: len(match.group(2)))
                 data = largest.group(2)
-                excess = len(prompt) + len(notice) - 100000
-                marker = " [TRUNCATED: untrusted content omitted]"
-                if len(data) <= excess + len(marker):
-                    raise LLMError("LLM_FAILED: prompt instructions exceed size limit")
-                data = data[:len(data) - excess - len(marker)] + marker
-                prompt = prompt[:largest.start(2)] + data + prompt[largest.end(2):]
-            prompt += notice
+                excess = len(prompt) - target
+                if len(data) > len(marker):
+                    data = data[:max(0, len(data) - excess - len(marker))] + marker
+                    prompt = prompt[:largest.start(2)] + data + prompt[largest.end(2):]
+                else:
+                    prompt = prompt[:largest.start()] + prompt[largest.end():]
+            if len(prompt) + len(notice) <= 100000:
+                prompt += notice
         try:
             result = self.runner(argv + [prompt], text=True, capture_output=True,
                                  timeout=self.config["timeout_s"], check=False)

@@ -447,3 +447,92 @@ The full existing suite must still pass (179 run, 12 skips before this work).
 - Decode Bird stdout as strict UTF-8, falling back to replacement decoding on invalid
   bytes for all Bird actions. JSON must still parse; otherwise raise `BIRD_FAILED`.
   Report `decode_repaired: true` in sync data if any Bird output needed replacement.
+
+## Amendments 5 (binding, override text above where they differ)
+
+### 5.1 Keepsakes
+
+- Triage `value` gains `keepsake`: the bookmark carries no reference knowledge, but it has
+  at least one image, GIF or video the owner plausibly saved for its own sake (meme, clip,
+  joke, art, reaction). `keepsake` requires media in the bundle, `wiki: false`, `bots: []`
+  and `skip_reason: null`. A contentless bookmark without media stays `skip`. Anything
+  with recoverable knowledge is never a keepsake.
+- A keepsake item skips the write stage. Module `keepsake.py` saves the media files to
+  `<vault>/media/keepsakes/<tweet_id>-<author>-<n>.<ext>`: images through the existing
+  bounded fetch (hosts `pbs.twimg.com` only), videos and animated GIFs through ffmpeg
+  stream copy to `.mp4` from HTTPS `video.twimg.com` URLs only, choosing the highest
+  bitrate variant present in the capture. Limits: `limits.keepsake_file_bytes`
+  (default 300000000) and `media.max_video_seconds`. Writes are atomic (temp file then
+  rename) and idempotent.
+- It appends one line per item to `<vault>/wiki/keepsakes.md` (created with a `# Keepsakes`
+  heading when missing): date, caption (triage summary, 160 characters), author, post
+  link and relative links to each saved file. `wiki/index.md` gains one
+  `- [Keepsakes](keepsakes.md)` entry in the lane section, once.
+- The deliver artifact for a keepsake is `{"wiki": null, "bots": [], "keepsake":
+  {"files": [...], "index": "..."}}`; final status is `kept`. A failed download fails the
+  item with `KEEPSAKE_FAILED` and is retried like any other failure.
+
+### 5.2 Catch-up capture and the archive boundary
+
+- Capture never queues a bookmark whose id is in the older archive manifest; those are
+  reached only through `lane seed`. Sync data reports `archive_seen` (count).
+- Normal sync stops paging at a page whose bookmarks are all known to the lane or the
+  archive. `lane sync --catch-up` keeps paging past pages known to the lane and stops
+  only at a page wholly in the archive, at the capture count, or at the other existing
+  stops. `--catch-up` defaults the capture count to 800 unless `--capture-count` is given.
+
+### 5.3 Source ledger and novelty (duplicates)
+
+- The lane database gains a `sources` ledger: one row per (evidence key, bookmark),
+  with the note title, a one-line takeaway (note `short_answer`, 200 characters), the
+  bots and topics it was delivered to, and the date. Evidence keys: normalized URL of
+  every successfully read link (lowercase host, no fragment, no `utm_*`/`ref`/`s`/`t`
+  tracking parameters, no trailing slash), `github:<owner>/<repo>`, `arxiv:<id>`,
+  `yt:<video id>`, and `x:<tweet id>` for the bookmark itself, every quoted post and
+  every parent post. Rows are written at delivery. At sync start the ledger is
+  backfilled for delivered items that have no rows.
+- Before triage the pipeline builds PRIOR COVERAGE: up to 5 earlier delivered notes
+  that share an evidence key with this bundle (title, source id, short answer, key
+  points, shared keys, bots), the lists of this bundle's known and new keys, and
+  RECENT NOTES: title and short answer of the most recent 80 lane notes. This replaces
+  `covered_by`.
+- Triage output gains `novelty` (`new`, `partial`, `duplicate`) and `duplicate_of`
+  (a source id from PRIOR COVERAGE or RECENT NOTES, required for `partial` and
+  `duplicate`, otherwise null). `duplicate` means the bookmark adds no substantive
+  information beyond that earlier note; when unsure the model must choose `partial`.
+  A different post recommending the same resources with no new resources or claims is
+  a duplicate.
+- `duplicate`: no note, no bot delivery, no bot run. Append `- Seen again: <date>
+  [@author](post url)` under a `## Seen again` section of the earlier wiki note when it
+  exists, record ledger rows for the new bookmark pointing at the earlier note, write a
+  deliver artifact `{"wiki": null, "bots": [], "duplicate_of": "<source id>"}`, final
+  status `duplicate`.
+- `partial`: the write stage receives PRIOR COVERAGE and writes only what is new,
+  naming the earlier note it builds on. Bots are chosen only when the new part changes
+  their work, and relevance is judged on the new part alone. Wiki notes and bot
+  references carry a `Builds on:` line linking the earlier note or reference when it
+  exists in the same place.
+- Each bot topic skill gets `sources.md`, regenerated at delivery from the ledger:
+  every source this bot topic has learned from (key or URL, date, takeaway, reference
+  file). The bot run prompt tells the bot to consult it and not to re-add lessons it
+  already has. `SKILL.md` links `sources.md` once.
+
+### 5.4 Removing synced bookmarks (the only X write)
+
+- `lane unbookmark` is the single exception to read-only X access. It is never called
+  by `sync`, never by `scripts/lane-sync.sh`, and never by an agent.
+- Eligible: items with status `done`, `kept` or `duplicate` (plus `skipped` only with
+  `--include-skipped`) that are not yet removed and whose delivered files still exist
+  on disk (wiki note or bot reference for `done`, every saved file for `kept`, the
+  earlier note's item being `done` for `duplicate`). Default 25 per run, maximum 100.
+- `--dry-run` lists what would be removed and exits. Otherwise the command requires
+  stdin and stderr to be an interactive terminal, verifies with `whoami` that the
+  capture profile is the configured `capture_user_id`, prints the count and each title
+  with its URL, and asks the operator to type `DELETE SYNCED BOOKMARKS`. Anything but
+  that exact line aborts with nothing removed. No flag, environment variable or config
+  key can skip the prompt.
+- It removes one bookmark per Bird call (`unbookmark <id>` on the capture profile),
+  waits `unbookmark.delay_s` (default 2) between calls, and stops at the first failure.
+  Each removal is appended and fsynced to `<vault>/lane/unbookmark-log.jsonl` (time,
+  source id, post URL, title) before the next call, and recorded in the database so it
+  is never attempted twice.

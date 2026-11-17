@@ -26,6 +26,10 @@ Media evidence may include transcripts and sampled frame descriptions. ASR trans
 can contain errors, and sampled frames are not the full video. Use what is actually
 available, qualify uncertainty, and do not claim to have watched the full video.
 
+The owner bookmarks many memes, clips and jokes just to keep the media; those are
+keepsake, not skip. Choose keepsake only when there is media but no reference knowledge;
+set wiki false, bots empty and skip_reason null. Anything with recoverable knowledge
+is not a keepsake.
 Skip only when there is no recoverable substance at all: deleted or unreadable content,
 a bare teaser whose target could not be found, or an empty reaction or joke with
 nothing to retain. Never skip merely because claims are
@@ -42,12 +46,23 @@ otherwise use normal. Use a short reusable topic of 2 to 5 words, reuse an exist
 bot topic where it fits, and provide its lowercase ASCII slug (3 to 40 characters,
 letters, digits and hyphens only). Set wiki true for general reference knowledge
 worth keeping for the owner, independent of bot delivery. If no bot fits and the
-value is not skip, wiki must be true. Existing wiki titles and already-covered
-hints are context, not proof of duplication; retain recoverable substance even if
-it overlaps existing coverage.
+value is neither skip nor keepsake nor duplicate, wiki must be true.
+Compare PRIOR COVERAGE and RECENT NOTES. Classify novelty as new, partial or duplicate.
+Duplicate means no substantive information beyond the earlier note; a different post
+recommending the same resources with no new resources or claims is duplicate. Partial
+means this bookmark concerns the SAME specific thing as an earlier note (the same
+source, resource, tool list, product, event or claim) and adds to it. Sharing only a
+general subject, field, author or tone with an earlier note is new, not partial.
+When unsure between duplicate and partial choose partial; when unsure between partial
+and new choose new. For partial judge value, wiki and bots on the NEW part only.
+For partial, duplicate_of must identify a source id in PRIOR COVERAGE or RECENT NOTES.
+For duplicate it must identify a PRIOR COVERAGE note sharing evidence, not just a
+RECENT NOTES entry, and new_keys must contain nothing except this bookmark's own
+x:<id> key. Otherwise use partial. duplicate_of must be null for new. Skip and keepsake are always new. For a
+duplicate set wiki false and bots empty.
 
 Return exactly one JSON object, without commentary, with exactly these keys:
-{"core":{"title":"...","summary":"...","where_found":"post|self_reply|author_reply|quoted|parent|link|media","primary_url":null},"value":"skip|low|normal|high","skip_reason":null,"wiki":true,"bots":[{"profile":"...","reason":"...","relevance":"normal|high","topic":"...","topic_slug":"..."}],"unresolved":null}.
+{"core":{"title":"...","summary":"...","where_found":"post|self_reply|author_reply|quoted|parent|link|media","primary_url":null},"value":"skip|keepsake|low|normal|high","skip_reason":null,"wiki":true,"bots":[{"profile":"...","reason":"...","relevance":"normal|high","topic":"...","topic_slug":"..."}],"unresolved":null,"novelty":"new|partial|duplicate","duplicate_of":null}.
 primary_url, skip_reason and unresolved are strings or null. All other strings must
 be nonempty. Use actual enum values, not the illustrative alternatives above.
 """
@@ -105,9 +120,26 @@ def _optional_string(value, field):
         _string(value, field)
 
 
-def validate(result: dict, profiles: set[str]) -> None:
-    if not isinstance(result, dict) or set(result) != {"core", "value", "skip_reason", "wiki", "bots", "unresolved"}:
+def validate(result: dict, profiles: set[str], *, has_media: bool = False, prior_ids=None, prior=None, source_id=None) -> None:
+    fields = {"core", "value", "skip_reason", "wiki", "bots", "unresolved"}
+    if not isinstance(result, dict) or set(result) not in (fields, fields | {"novelty", "duplicate_of"}):
         raise ValueError("invalid triage fields")
+    novelty = result.get("novelty", "new")
+    duplicate_of = result.get("duplicate_of")
+    if novelty not in ("new", "partial", "duplicate"):
+        raise ValueError("invalid novelty")
+    if novelty == "new" and duplicate_of is not None:
+        raise ValueError("new requires null duplicate_of")
+    if novelty != "new":
+        _string(duplicate_of, "duplicate_of")
+        if prior is not None:
+            coverage = prior["coverage"]
+            prior_ids = {n["source_id"] for n in coverage["notes"] + prior["recent"]}
+            if novelty == "duplicate" and (duplicate_of not in {n["source_id"] for n in coverage["notes"]}
+                                              or any(key != source_id for key in coverage["new_keys"])):
+                raise ValueError("duplicate requires a PRIOR COVERAGE note and no new keys except the bookmark's own x:<id>; use partial")
+        if prior_ids is not None and duplicate_of not in prior_ids:
+            raise ValueError("duplicate_of must identify a prior note")
     core = result["core"]
     if not isinstance(core, dict) or set(core) != {"title", "summary", "where_found", "primary_url"}:
         raise ValueError("invalid core fields")
@@ -116,7 +148,7 @@ def validate(result: dict, profiles: set[str]) -> None:
     if core["where_found"] not in ("post", "self_reply", "author_reply", "quoted", "parent", "link", "media"):
         raise ValueError("invalid core.where_found")
     _optional_string(core["primary_url"], "core.primary_url")
-    if result["value"] not in ("skip", "low", "normal", "high"):
+    if result["value"] not in ("skip", "keepsake", "low", "normal", "high"):
         raise ValueError("invalid value")
     _optional_string(result["skip_reason"], "skip_reason")
     _optional_string(result["unresolved"], "unresolved")
@@ -141,11 +173,21 @@ def validate(result: dict, profiles: set[str]) -> None:
             raise ValueError("invalid topic_slug")
         if not 2 <= len(bot["topic"].split()) <= 5:
             raise ValueError("topic must contain 2 to 5 words")
-    if result["value"] != "skip" and not result["bots"] and not result["wiki"]:
+    if result["value"] == "keepsake" and (not has_media or result["wiki"] or result["bots"]):
+        raise ValueError("keepsake requires media and no destinations")
+    if result["value"] in ("skip", "keepsake") and novelty != "new":
+        raise ValueError("skip and keepsake must be new")
+    if novelty == "duplicate" and (result["wiki"] or result["bots"]):
+        raise ValueError("duplicate cannot have destinations")
+    if result["value"] not in ("skip", "keepsake") and novelty != "duplicate" and not result["bots"] and not result["wiki"]:
         raise ValueError("non-skipped item without bots must go to wiki")
 
 
-def triage(bundle, roster, wiki_titles: list[str], llm, covered_by: str | None = None) -> dict:
+def triage(bundle, roster, wiki_titles: list[str], llm, prior=None) -> dict:
+    prior = prior or {"coverage": {"notes": [], "known_keys": [], "new_keys": []}, "recent": []}
+
     prompt = prompt_with_data(TRIAGE_INSTRUCTIONS, [("ROSTER", roster), ("BUNDLE", bundle),
-                              ("WIKI TITLES", wiki_titles), ("ALREADY COVERED BY", covered_by)], bundle)
-    return llm.json(prompt, lambda result: validate(result, {p["id"] for p in roster}))
+                              ("WIKI TITLES", wiki_titles), ("PRIOR COVERAGE", prior["coverage"]),
+                              ("RECENT NOTES", prior["recent"])], bundle,
+                              priority=["RECENT NOTES", "WIKI TITLES", "PRIOR COVERAGE", "ROSTER", "BUNDLE"])
+    return llm.json(prompt, lambda result: validate(result, {p["id"] for p in roster}, has_media=bool(bundle.get("media")), prior=prior, source_id=bundle.get("source_id")))

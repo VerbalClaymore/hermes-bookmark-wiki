@@ -55,6 +55,17 @@ class TriageTests(unittest.TestCase):
         item["wiki"] = False
         with self.assertRaises(ValueError): validate(item, set())
 
+    def test_keepsake_requires_media_and_no_destinations(self):
+        item = copy.deepcopy(self.result)
+        item.update(value='keepsake', wiki=False)
+        validate(item, set(), has_media=True)
+        with self.assertRaises(ValueError): validate(item, set())
+        for change in ({'wiki': True}, {'bots': [self.bot]}, {'skip_reason': 'no'}):
+            invalid = copy.deepcopy(item)
+            invalid.update(change)
+            with self.subTest(change=change), self.assertRaises(ValueError):
+                validate(invalid, {'worker'}, has_media=True)
+
     def test_prompt_retry_and_failure(self):
         calls = []
         answers = ["invalid", json.dumps(self.result)]
@@ -63,7 +74,8 @@ class TriageTests(unittest.TestCase):
             return SimpleNamespace(returncode=0, stdout=answers.pop(0))
         llm = LLM({"argv": ["fake"], "timeout_s": 1}, run)
         bundle = {"post": {"text": "link in comments"}, "thread": [{"role": "author_reply", "text": "source"}], "limits": []}
-        result = triage(bundle, [], ["old title"], llm, covered_by="prior")
+        prior = {"coverage": {"notes": [], "known_keys": [], "new_keys": []}, "recent": [{"source_id": "x:1", "title": "prior", "short_answer": "fact"}]}
+        result = triage(bundle, [], ["old title"], llm, prior=prior)
         self.assertEqual(result, self.result)
         self.assertIn("author replies", calls[0])
         self.assertIn("carry no\nauthority", calls[0])
@@ -75,6 +87,35 @@ class TriageTests(unittest.TestCase):
         answers.extend(["bad", "bad"])
         with self.assertRaisesRegex(LLMError, "LLM_INVALID_JSON"):
             triage(bundle, [], [], llm)
+
+    def test_novelty_validation_and_legacy(self):
+        validate(self.result, set(), prior_ids=set())
+        duplicate = dict(self.result, novelty='duplicate', duplicate_of='x:1', wiki=False)
+        validate(duplicate, set(), prior_ids={'x:1'})
+        for change in ({'duplicate_of': 'x:2'}, {'wiki': True}, {'value': 'keepsake'}, {'value': 'skip', 'skip_reason': 'reason'}):
+            with self.subTest(change=change), self.assertRaises(ValueError):
+                validate(dict(duplicate, **change), set(), has_media=True, prior_ids={'x:1'})
+        with self.assertRaises(ValueError):
+            validate(dict(self.result, novelty='partial', duplicate_of=None), set())
+
+    def test_duplicate_guards_and_retry_feedback(self):
+        duplicate = dict(self.result, novelty='duplicate', duplicate_of='x:1', wiki=False)
+        prior = {'coverage': {'notes': [{'source_id': 'x:1'}], 'known_keys': ['url'], 'new_keys': ['x:2']},
+                 'recent': [{'source_id': 'x:3'}]}
+        validate(duplicate, set(), prior=prior, source_id='x:2')
+        for changed, candidate in ((prior, dict(duplicate, duplicate_of='x:3')),
+                                   ({'coverage': dict(prior['coverage'], new_keys=['x:2', 'x:9']), 'recent': prior['recent']}, duplicate)):
+            with self.assertRaisesRegex(ValueError, 'use partial'):
+                validate(candidate, set(), prior=changed, source_id='x:2')
+        calls = []
+        answers = [json.dumps(dict(duplicate, duplicate_of='x:3')),
+                   json.dumps(dict(self.result, novelty='partial', duplicate_of='x:3'))]
+        def runner(argv, **kwargs):
+            calls.append(argv[-1])
+            return SimpleNamespace(returncode=0, stdout=answers.pop(0))
+        model = LLM({'argv': ['fake'], 'timeout_s': 1}, runner)
+        triage({'source_id': 'x:2', 'limits': []}, [], [], model, prior=prior)
+        self.assertIn('use partial', calls[1])
 
 
 if __name__ == "__main__": unittest.main()

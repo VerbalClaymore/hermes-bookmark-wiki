@@ -59,9 +59,20 @@ _ELSEWHERE = re.compile(
 
 def _urls(text):
     for match in _URL.finditer(text or ""):
-        url = match.group().rstrip('.,!?;:\'"')
-        while url.endswith(')') and url.count(')') > url.count('('):
-            url = url[:-1]
+        url = match.group()
+        while True:
+            trimmed = url.rstrip('.,!?;:\'"')
+            for close, open_ in ((')', '('), (']', '['), ('}', '{')):
+                while trimmed.endswith(close) and trimmed.count(close) > trimmed.count(open_):
+                    trimmed = trimmed[:-1]
+            if trimmed == url:
+                break
+            url = trimmed
+        try:
+            urlsplit(url)
+        except ValueError:
+            # Unparseable text (for example a stray bracket) is not a link.
+            continue
         yield url
 
 

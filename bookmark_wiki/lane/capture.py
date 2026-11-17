@@ -39,15 +39,21 @@ def groups(tweets: list[dict]) -> list[tuple[str, list[dict]]]:
     return results
 
 
-def capture(vault: str | Path, store: Store, config: dict, bird, *, metadata=None) -> list[str]:
+def capture(vault: str | Path, store: Store, config: dict, bird, *, metadata=None,
+            catch_up: bool = False, capture_count: int | None = None) -> list[str]:
     profile = config["bird"]["capture_profile"]
     expected = config["bird"]["capture_user_id"]
     identity = bird.run("whoami", [], profile=profile)
     matches = re.findall(r"(?m)^\s*user_id:\s*(\d+)\s*$", identity)
     if matches != [expected]:
         raise BirdError("CAPTURE_ACCOUNT_MISMATCH: capture account not verified")
-    count = config["limits"]["capture_count"]
-    known = set(manifest_sources(vault))
+    count = capture_count if capture_count is not None else (800 if catch_up else config["limits"]["capture_count"])
+    if not isinstance(count, int) or isinstance(count, bool) or count < 1:
+        raise ValueError("invalid capture count")
+    archive = set(manifest_sources(vault))
+    known = set(archive)
+    if metadata is not None:
+        metadata["archive_seen"] = 0
     for row in store.db.execute("SELECT source_id, tweet_id, stage FROM items"):
         known.add(row["source_id"])
         if row["stage"] is None and not store.artifact(row["tweet_id"], "capture").exists():
@@ -98,11 +104,17 @@ def capture(vault: str | Path, store: Store, config: dict, bird, *, metadata=Non
             known.intersection({"x:" + root} | {"x:" + str(t["id"]) for t in members})
             for root, members in page_groups
         )
+        page_all_archive = all(
+            archive.intersection({"x:" + root} | {"x:" + str(t["id"]) for t in members})
+            for root, members in page_groups
+        )
         for root, members in page_groups:
             if root in seen_groups:
                 continue
             seen_groups.add(root)
             ids = {"x:" + root} | {"x:" + str(t["id"]) for t in members}
+            if archive.intersection(ids) and metadata is not None:
+                metadata["archive_seen"] += 1
             if not known.intersection(ids):
                 record = {"source_id": "x:" + root, "tweet_id": root,
                           "captured_at": store.clock().isoformat(), "tweets": members}
@@ -111,7 +123,8 @@ def capture(vault: str | Path, store: Store, config: dict, bird, *, metadata=Non
                     known.update(ids)
             if len(seen_groups) >= count:
                 break
-        if len(seen_groups) >= count or page_all_known or not next_cursor or next_cursor in seen_cursors:
+        if (len(seen_groups) >= count or (page_all_archive if catch_up else page_all_known)
+                or not next_cursor or next_cursor in seen_cursors):
             break
         seen_cursors.add(next_cursor)
         cursor = next_cursor
