@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import sys
 
 from . import archive, retrieval
@@ -55,6 +56,8 @@ def _parser():
         if action in ("apply", "publish"): command.add_argument("--input", required=True)
         if action in ("handoffs", "digest"): command.add_argument("--batch-id", required=True)
         if action == "status": command.add_argument("--batch-id")
+    from .lane import cli as lane_cli
+    lane_cli.register(sub)
     return parser
 
 
@@ -93,9 +96,19 @@ def _fixed_message(code):
     }.get(code, "Operation failed.")
 
 
+def _lane_error(exc):
+    text = str(exc)
+    match = re.match(r'^([A-Z][A-Z_]+): ', text)
+    code = match.group(1) if match else 'LANE_ERROR'
+    message = ' '.join((text[match.end():] if match else text).split())[:400]
+    result = _envelope('error', 'lane', error=code)
+    result['error']['message'] = message
+    return result
+
+
 def main(argv=None):
     argv = list(sys.argv[1:] if argv is None else argv)
-    known_commands = {"update", "status", "search", "show", "intake", "learning", "bulk"}
+    known_commands = {"update", "status", "search", "show", "intake", "learning", "bulk", "lane"}
     command = argv[0] if argv and argv[0] in known_commands else "unknown"
     try:
         args = _parser().parse_args(argv)
@@ -132,6 +145,14 @@ def main(argv=None):
             else: data = bulk.digest_report(args.vault, args.batch_id)
             result = _envelope("ok", command, data=data)
             exit_code = 0
+        elif args.command == "lane":
+            from .lane import cli as lane_cli
+            try:
+                result = _envelope("ok", command, data=lane_cli.dispatch(args))
+                exit_code = 0
+            except Exception as exc:
+                result = _lane_error(exc)
+                exit_code = 2
         elif args.command == "learning":
             from . import learning
             action = args.learning_action
@@ -143,8 +164,8 @@ def main(argv=None):
             exit_code = 0
         else:
             raise ParseFailure("unknown command")
-    except ParseFailure:
-        result = _envelope("error", command, error="INVALID_ARGUMENT")
+    except ParseFailure as exc:
+        result = _lane_error(exc) if command == 'lane' else _envelope("error", command, error="INVALID_ARGUMENT")
         exit_code = 2
     except __import__("bookmark_wiki.learning", fromlist=["LearningError"]).LearningError as exc:
         result = _envelope("error", command, error=exc.code)
@@ -158,9 +179,9 @@ def main(argv=None):
     except retrieval.InvalidArgument as exc:
         result = _envelope("error", command, error=exc.code)
         exit_code = 2
-    except Exception:
+    except Exception as exc:
         # The public boundary intentionally emits no exception text or paths.
-        result = _envelope("error", command, error="IO_ERROR")
+        result = _lane_error(exc) if command == 'lane' else _envelope("error", command, error="IO_ERROR")
         exit_code = 2
     sys.stdout.write(json.dumps(result, ensure_ascii=False, sort_keys=True, separators=(",", ":")) + "\n")
     return exit_code

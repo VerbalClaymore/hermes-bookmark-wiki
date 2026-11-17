@@ -5,6 +5,19 @@ The Python import and command name remains `bookmark_wiki`.
 
 See [current status](docs/STATUS.md) for the distinction between reviewed code and live acceptance. Historical specifications retain their original phase-specific instructions; the initial GitHub publication does not activate a batch or schedule.
 
+## Day-to-day use: the lean lane
+
+To sync new X bookmarks and deliver them to the wiki and the right Hermes bots:
+
+```sh
+scripts/lane-sync.sh
+```
+
+See the [lane runbook](docs/LANE_RUNBOOK.md) for what it does, what to report,
+other commands and troubleshooting. Agents should start at [AGENTS.md](AGENTS.md).
+Everything below this section describes the older gated archive lane, which the
+lean lane does not modify.
+
 BookmarkWiki is a local-only Python 3 reference implementation for importing an allowlisted bookmark snapshot into an append-only manifest and SQLite FTS5 search index.
 
 ## Guarantees
