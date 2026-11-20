@@ -7,6 +7,15 @@ from bookmark_wiki.lane import cli
 
 
 class LaneCliTests(unittest.TestCase):
+    def test_prune_orphans_defaults_to_preview(self):
+        parser = argparse.ArgumentParser()
+        cli.register(parser.add_subparsers(dest='command', required=True))
+        for extra, expected in (([], False), (['--apply'], True)):
+            args = parser.parse_args(['lane', 'prune-orphans', '--vault', '/v'] + extra)
+            with patch.object(cli.pipeline, 'prune_orphans', return_value={}) as prune:
+                cli.dispatch(args)
+            prune.assert_called_once_with('/v', apply=expected)
+
     def test_newer_than_sync_only(self):
         parser = argparse.ArgumentParser()
         cli.register(parser.add_subparsers(dest='command', required=True))

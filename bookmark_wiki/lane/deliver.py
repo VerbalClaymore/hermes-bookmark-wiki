@@ -305,15 +305,121 @@ def _sources_text(rows):
     return '\n'.join(lines) + '\n'
 
 
+def cleanup_delivery(item_dir, vault, home, item_id, previous, current, *, sources=None, apply=True):
+    """Remove superseded item-owned paths and repair local Markdown links."""
+    item_dir, vault, home = map(lambda p: Path(p).absolute(), (item_dir, vault, home))
+    store.tweet_id(item_id)
+    changes = []
+    wiki_dir = _safe_path(vault, 'wiki', 'topics')
+    profiles = _safe_path(home, 'profiles')
+
+    def valid(path, directory, pattern):
+        if not isinstance(path, str):
+            return None
+        candidate = Path(path)
+        if not candidate.is_absolute() or candidate.parent != directory or not re.fullmatch(pattern, candidate.name):
+            return None
+        _safe_path(directory, candidate.name)
+        return candidate
+
+    def edit(path, transform, action):
+        if path.exists() and path.is_file():
+            _safe_path(path.parent, path.name)
+            old = path.read_bytes().decode('utf-8')
+            new = transform(old)
+            if old != new:
+                changes.append({'action': action, 'path': str(path)})
+                if apply:
+                    _write(path, new, item_dir)
+
+    def drop_line(path, target):
+        pattern = re.compile(r'\]\(' + re.escape(target) + r'(?:[)#?])')
+        edit(path, lambda text: ''.join(line for line in text.splitlines(keepends=True)
+                                        if not pattern.search(line)), 'remove-entry')
+
+    def redirect(old, new, root):
+        if new is None or not root.is_dir():
+            return
+        for path in sorted(root.glob('*.md')):
+            if path == old or path.is_symlink() or not path.is_file():
+                continue
+            def replace(text):
+                def link(match):
+                    parts = urlsplit(match.group(1))
+                    if parts.scheme or parts.netloc or not parts.path or '%' in parts.path:
+                        return match.group(0)
+                    if (path.parent / parts.path).resolve() != old:
+                        return match.group(0)
+                    replacement = os.path.relpath(new, path.parent)
+                    suffix = ('?' + parts.query if parts.query else '') + ('#' + parts.fragment if parts.fragment else '')
+                    return '](' + replacement + suffix + ')'
+                return re.sub(r'\]\(([^\s()]+)\)', link, text)
+            edit(path, replace, 'redirect-links')
+
+    def remove(path):
+        if path and path.is_file():
+            _safe_path(path.parent, path.name)
+            changes.append({'action': 'delete', 'path': str(path)})
+            if apply:
+                _backup(path, item_dir)
+                path.unlink()
+
+    wiki_pattern = r'Bookmark_' + re.escape(item_id) + r'_[a-z0-9-]+\.md'
+    old = valid((previous.get('wiki') or {}).get('path'), wiki_dir, wiki_pattern)
+    new = valid((current.get('wiki') or {}).get('path'), wiki_dir, wiki_pattern)
+    if current.get('wiki') and new is None:
+        raise ValueError('invalid current wiki delivery path')
+    if old and old != new:
+        redirect(old, new, wiki_dir)
+        drop_line(_safe_path(vault, 'wiki', 'index.md'), 'topics/' + old.name)
+        remove(old)
+
+    current_bots = {(b.get('profile'), b.get('topic_slug')): b for b in current.get('bots', []) if isinstance(b, dict)}
+    for bot in previous.get('bots', []):
+        if not isinstance(bot, dict):
+            continue
+        profile, topic = bot.get('profile'), bot.get('topic_slug')
+        if not isinstance(profile, str) or not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9_-]*', profile):
+            continue
+        if not isinstance(topic, str) or not re.fullmatch(r'[a-z0-9-]{3,40}', topic):
+            continue
+        skill_dir = _safe_path(profiles, profile, 'skills', 'bookmarks', topic)
+        ref_dir = _safe_path(skill_dir, 'references')
+        pattern = re.escape(item_id) + r'-[a-z0-9-]+\.md'
+        old = valid(bot.get('reference_path'), ref_dir, pattern)
+        new = valid(current_bots.get((profile, topic), {}).get('reference_path'), ref_dir, pattern)
+        if (profile, topic) in current_bots and new is None:
+            raise ValueError('invalid current bot delivery path')
+        if old and old != new:
+            if profiles.is_dir():
+                for ref_root in sorted(profiles.glob('*/skills/bookmarks/*/references')):
+                    if ref_root.resolve() == ref_root.absolute() and ref_root.is_dir():
+                        redirect(old, new, ref_root)
+            drop_line(_safe_path(skill_dir, 'SKILL.md'), 'references/' + old.name)
+            remove(old)
+            if new is None and sources is not None:
+                rows = sources(profile, topic) if callable(sources) else sources
+                rows = [row for row in rows if row['source_id'] != 'x:' + item_id]
+                sources_path = _safe_path(skill_dir, 'sources.md')
+                if sources_path.exists():
+                    edit(sources_path, lambda text: _sources_text(rows), 'refresh-sources')
+    return changes
+
+
 def deliver(item_dir: Path, bundle, triage_result, note, config, vault: Path, *,
             bot_runner=subprocess.run, clock=store.utc_now, bot_runs: bool = True,
-            builds_on=None, sources=None) -> dict:
+            builds_on=None, sources=None, previous=None) -> dict:
     item_dir = Path(item_dir).absolute()
     vault = Path(vault).absolute()
     source_id = bundle["source_id"]
     if not isinstance(source_id, str) or not source_id.startswith("x:"):
         raise ValueError("invalid source id")
     item_id = store.tweet_id(source_id[2:])
+    if previous is None:
+        artifact = item_dir / 'delivery.json'
+        if artifact.is_file():
+            with artifact.open(encoding='utf-8') as stream:
+                previous = json.load(stream)
     now = clock()
     date = now.date().isoformat()
     slug = _slug(note["title"])
@@ -364,10 +470,13 @@ def deliver(item_dir: Path, bundle, triage_result, note, config, vault: Path, *,
         rows = sources(profile, topic_slug) if callable(sources) else (sources or [])
         rows = [row for row in rows if row['source_id'] != source_id]
         rows += ledger.item_sources(bundle, note, str(reference), now.isoformat())
-        _write(_safe_path(skill_dir, 'sources.md'), _sources_text(rows), item_dir)
+        sources_path = _safe_path(skill_dir, 'sources.md')
         run = None
         if bot["relevance"] == "high" and bot_runs and config["hermes"]["bot_runs"]:
             run = _bot_run(profile_dir, profile, reference, config, bot_runner, builds_on)
+        _write(sources_path, _sources_text(rows), item_dir)
         result["bots"].append({"profile": profile, "topic_slug": topic_slug,
                                "reference_path": str(reference), "bot_run": run})
+    if previous:
+        cleanup_delivery(item_dir, vault, home, item_id, previous, result, sources=sources)
     return result

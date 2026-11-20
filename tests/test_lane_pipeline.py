@@ -115,6 +115,93 @@ class PipelineTests(unittest.TestCase):
         self.assertEqual(pipeline.status(self.vault)['statuses'], {'done': 1})
         self.assertEqual(pipeline.show(self.vault, 'x:1')['item']['stage'], 'deliver')
 
+    def test_retry_changed_slug_repairs_links_and_removed_topic(self):
+        self.tweets(1)
+        first = self.run_sync()['items'][0]['delivery']
+        old_wiki = Path(first['wiki']['path'])
+        old_ref = Path(first['bots'][0]['reference_path'])
+        other = old_wiki.parent / 'other.md'
+        other.write_text(f'Builds on: [old]({old_wiki.name})\n')
+        other_ref = old_ref.parent / '2-other.md'
+        other_ref.write_text(f'Builds on: [old]({old_ref.name})\n')
+        pipeline.retry(self.vault, 'x:1', from_stage='triage')
+        original = self.llm.json
+        def changed(prompt, validator):
+            # Only the writer needs a new title.
+            def writer(result):
+                if 'short_answer' in result:
+                    result['title'] = 'New title'
+                validator(result)
+            return original(prompt, writer)
+        self.llm.json = changed
+        second = self.run_sync(capture=False)['items'][0]
+        self.assertEqual(second['status'], 'done')
+        new_wiki = Path(second['delivery']['wiki']['path'])
+        new_ref = Path(second['delivery']['bots'][0]['reference_path'])
+        self.assertFalse(old_wiki.exists())
+        self.assertFalse(old_ref.exists())
+        self.assertIn(new_wiki.name, other.read_text())
+        self.assertIn(new_ref.name, other_ref.read_text())
+        self.assertNotIn(old_wiki.name, (self.vault / 'wiki/index.md').read_text())
+        self.assertNotIn(old_ref.name, (old_ref.parent.parent / 'SKILL.md').read_text())
+        self.assertTrue(list((self.vault / 'lane/items/1/backups').glob(old_wiki.name + '.*.bak')))
+        self.assertTrue(list((self.vault / 'lane/items/1/backups').glob(old_ref.name + '.*.bak')))
+
+        pipeline.retry(self.vault, 'x:1', from_stage='triage')
+        def no_bot(prompt, validator):
+            def change(result):
+                if 'short_answer' not in result:
+                    result['bots'] = []
+                validator(result)
+            return changed(prompt, change)
+        self.llm.json = no_bot
+        third = self.run_sync(capture=False)['items'][0]
+        self.assertEqual(third['status'], 'done')
+        self.assertFalse(new_ref.exists())
+        self.assertNotIn(new_ref.name, (new_ref.parent.parent / 'SKILL.md').read_text())
+        self.assertNotIn('Useful example', (new_ref.parent.parent / 'sources.md').read_text())
+
+    def test_retry_same_slug_has_no_extra_cleanup(self):
+        self.tweets(1)
+        first = self.run_sync()['items'][0]['delivery']
+        path = Path(first['wiki']['path'])
+        ref = Path(first['bots'][0]['reference_path'])
+        pipeline.retry(self.vault, 'x:1', from_stage='triage')
+        self.assertEqual(self.run_sync(capture=False)['items'][0]['status'], 'done')
+        self.assertTrue(path.exists())
+        self.assertTrue(ref.exists())
+        self.assertEqual((self.vault / 'wiki/index.md').read_text().count(path.name), 1)
+        self.assertEqual((ref.parent.parent / 'SKILL.md').read_text().count(ref.name), 1)
+        self.assertFalse(list((self.vault / 'lane/items/1/backups').glob(path.name + '.*.bak')))
+
+    def test_prune_orphans_preview_and_apply(self):
+        self.tweets(1)
+        delivery = self.run_sync()['items'][0]['delivery']
+        wiki = Path(delivery['wiki']['path'])
+        ref = Path(delivery['bots'][0]['reference_path'])
+        old_wiki = wiki.with_name('Bookmark_1_old.md')
+        old_ref = ref.with_name('1-old.md')
+        old_wiki.write_text('old wiki')
+        old_ref.write_text('old reference')
+        index = self.vault / 'wiki/index.md'
+        skill = ref.parent.parent / 'SKILL.md'
+        index.write_text(index.read_text() + f'- [old](topics/{old_wiki.name})\n')
+        skill.write_text(skill.read_text() + f'- [old](references/{old_ref.name})\n')
+        other = wiki.parent / 'other.md'
+        other.write_text(f'Builds on: [old]({old_wiki.name})\n')
+        before = {p: p.read_bytes() for p in (wiki, ref, old_wiki, old_ref, index, skill, other)}
+        preview = pipeline.prune_orphans(self.vault)
+        self.assertIn(str(old_wiki), [c['path'] for c in preview['changes']])
+        self.assertIn(str(old_ref), [c['path'] for c in preview['changes']])
+        self.assertEqual(before, {p: p.read_bytes() for p in before})
+        applied = pipeline.prune_orphans(self.vault, apply=True)
+        self.assertEqual(preview['changes'], applied['changes'])
+        self.assertFalse(old_wiki.exists())
+        self.assertFalse(old_ref.exists())
+        self.assertNotIn(old_wiki.name, index.read_text())
+        self.assertNotIn(old_ref.name, skill.read_text())
+        self.assertIn(wiki.name, other.read_text())
+
     def test_keepsake_dry_run_resume_and_finality(self):
         self.tweets(1)
         self.bird.tweets[0]['media'] = [{'type': 'photo', 'url': 'https://pbs.twimg.com/a'}]
@@ -225,6 +312,31 @@ class PipelineTests(unittest.TestCase):
             with self.subTest(invalid=invalid), self.assertRaises(ValueError):
                 self.run_sync(newer_than=invalid)
         self.assertEqual({item['source_id'] for item in self.run_sync(capture=False)['items']}, {'x:1', 'x:4'})
+
+    def test_newer_than_processes_pending_reply_after_cutoff(self):
+        self.tweets(2)
+        self.bird.tweets[0].update(threadRootId='1', createdAt='2026-11-17T12:00:00Z')
+        self.assertEqual(self.run_sync(newer_than='2026-11-18')['items'], [])
+        self.assertEqual(pipeline.show(self.vault, 'x:1')['item']['status'], 'pending')
+        result = self.run_sync(capture=False, newer_than='2026-11-16')
+        self.assertEqual([(item['source_id'], item['status']) for item in result['items']], [('x:1', 'done')])
+
+    def test_newer_than_leaves_pending_reply_before_cutoff(self):
+        self.tweets(2)
+        self.bird.tweets[0].update(threadRootId='1', createdAt='2026-11-15T12:00:00Z')
+        self.assertEqual(self.run_sync(newer_than='2026-11-16')['items'], [])
+        item = pipeline.show(self.vault, 'x:1')
+        self.assertEqual(item['item']['status'], 'pending')
+        self.assertEqual(item['item']['attempts'], 0)
+        self.assertEqual([tweet['id'] for tweet in item['artifacts']['capture']['tweets']], ['2'])
+
+    def test_newer_than_uses_earliest_parseable_reply_date(self):
+        self.tweets(2, 3, 4)
+        for tweet, created_at in zip(self.bird.tweets, ('invalid', '2026-11-17T12:00:00Z', '2026-11-15T12:00:00Z')):
+            tweet.update(threadRootId='1', createdAt=created_at)
+        self.assertEqual(self.run_sync(newer_than='2026-11-16')['items'], [])
+        result = self.run_sync(capture=False, newer_than='2026-11-15')
+        self.assertEqual([item['source_id'] for item in result['items']], ['x:1'])
 
     def test_dry_run_writes_no_external_files_then_resumes(self):
         self.tweets(1)

@@ -67,21 +67,33 @@ LANE() { env -u PYTHONPATH -u PYTHONHOME PYTHONDONTWRITEBYTECODE=1 \
 | Need | Command |
 | --- | --- |
 | Counts by status, list of failures | `LANE status` |
-| Everything recorded for one bookmark | `LANE show --id <tweet_id>` |
-| Redo one bookmark from a stage | `LANE retry --id <tweet_id> --from-stage resolve` |
+| Everything recorded for one bookmark | `LANE show --id x:<tweet_id>` |
+| Redo one bookmark from a stage | `LANE retry --id x:<tweet_id> --from-stage resolve` |
 | Process waiting items without contacting X | `scripts/lane-sync.sh --no-capture` |
 | Process only a few | `scripts/lane-sync.sh --limit 5` |
 | Deliver files but do not run any bot | `scripts/lane-sync.sh --no-bot-runs` |
 | Preview without writing wiki or bot files | `scripts/lane-sync.sh --dry-run --limit 3` |
 | Look further back than the newest 40 | `scripts/lane-sync.sh --capture-count 200` |
 | Catch up to the old archive boundary | `scripts/lane-sync.sh --catch-up` |
-| Process only posts dated on or after a day | `scripts/lane-sync.sh --no-capture --newer-than 2026-11-01` |
-| Redo a skipped item as a possible keepsake | `LANE retry --id <tweet_id> --from-stage triage` |
+| Process only posts dated on or after a day | `scripts/lane-sync.sh --no-capture --newer-than 2026-11-01` (a bookmarked reply is filed under its conversation root; when the root post was not captured, the earliest captured tweet's date is used) |
+| Redo a skipped item as a possible keepsake | `LANE retry --id x:<tweet_id> --from-stage triage` |
+| Preview or remove superseded delivery files | `LANE prune-orphans` / `LANE prune-orphans --apply` |
 | Queue specific posts | `LANE seed --ids <id>,<id>` |
 | Queue from the old archive | `LANE seed --from-archive --newest-first --limit 50` |
 
 Stages for `retry`: `capture`, `resolve`, `triage`, `write`, `deliver`.
+Ids take the `x:` prefix (`x:2118756438550196404`); a bare number is rejected
+with `invalid source id`. `retry` only clears the item from that stage on and
+puts it back in the queue. The next `lane-sync.sh --no-capture` processes it,
+and sync picks the newest-dated items first, so a retried item waits behind any
+newer pending ones; raise `--limit` to reach it.
 `--capture-count` accepts up to 800.
+
+If a redelivered note gets a new title, the lane removes the earlier wiki note,
+its `wiki/index.md` line, earlier bot reference files and their `SKILL.md` lines
+(each backed up to `items/<tweet_id>/backups/` first), and points links in other
+notes at the new file. `prune-orphans` does the same for leftovers made before
+this existed. It defaults to a JSON dry run; `--apply` performs it.
 
 ## Where things are
 
@@ -127,8 +139,11 @@ quoted and parent posts. Before triage, a new bookmark is compared against it.
   note and brings no new readable source of its own. Similar wording alone is
   never enough; that case becomes a partial note instead.
 - Each bot topic has a `sources.md` listing what that topic already absorbed.
-  Bot runs are told to consult it and not to re-add lessons.
-- To overrule a duplicate verdict: `LANE retry --id <tweet_id> --from-stage triage`.
+  Bot runs are told to consult it and not to re-add lessons. The bot runs
+  before the new bookmark is added to `sources.md`, so it judges the new item
+  against what was there before; the file is updated after the run, whether the
+  run changed something, failed, timed out or was skipped.
+- To overrule a duplicate verdict: `LANE retry --id x:<tweet_id> --from-stage triage`.
 
 ## Catching up on older bookmarks
 
@@ -184,7 +199,7 @@ again by hand; the log holds the URLs.
 | --- | --- |
 | `BIRD_FAILED: ...` at capture | Chrome profile is logged out of X, or Bird changed. Check with the Bird `whoami` command using the argv in `config.json`. Capture failure does not block `--no-capture` processing. |
 | `invalid Bird JSON` or `invalid Bird output encoding` | Bird runs under bun, which truncates piped output and can corrupt output past 256 KB. The lane already pages 20 at a time and writes to a file. Do not raise the page size. |
-| One item `failed` | `LANE show --id <id>` for the error, then `LANE retry --id <id> --from-stage <stage>`. |
+| One item `failed` | `LANE show --id x:<id>` for the error, then `LANE retry --id x:<id> --from-stage <stage>`. |
 | Note says a link was "not read" | JavaScript-only pages and PDFs are recorded but not read. Report it to the user. |
 | A bot run timed out | The reference file was still delivered. `retry --from-stage deliver` reruns delivery. |
 | Tests fail with path-safety errors | Set `TMPDIR=/Users/vernon/.hermes/profiles/geoffrey/cache/scratch` (the default macOS temp path is a symlink). |

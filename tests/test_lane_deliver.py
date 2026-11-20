@@ -250,6 +250,65 @@ class DeliveryTests(unittest.TestCase):
         self.config['hermes']['bot_runs'] = False
         self.assertIsNone(self.run_delivery()['bots'][0]['bot_run'])
 
+    def test_bot_sees_previous_sources_before_current_source_is_written(self):
+        self.triage['wiki'] = False
+        self.bot['relevance'] = 'high'
+        sources_path = self.profile / 'skills/bookmarks/useful-topic/sources.md'
+        seen = []
+
+        def runner(argv, **kwargs):
+            seen.append(sources_path.read_text() if sources_path.exists() else None)
+            return subprocess.CompletedProcess(argv, 0, stdout='NONE: no changes')
+
+        first = self.run_delivery(runner)
+        first_ref = Path(first['bots'][0]['reference_path']).name
+        self.assertIsNone(seen[0])
+        self.assertIn(first_ref, sources_path.read_text())
+        prior = [{'source_id': 'x:123', 'key': 'x:123', 'title': 'Useful Example',
+                  'takeaway': 'Old', 'created_at': '2026-01-01T00:00:00+00:00',
+                  'reference_path': first['bots'][0]['reference_path']}]
+        self.bundle = {'source_id': 'x:124'}
+        self.note['title'] = 'Next'
+        second = self.run_delivery(runner, sources=prior)
+        second_ref = Path(second['bots'][0]['reference_path']).name
+        self.assertIn(first_ref, seen[1])
+        self.assertIn('https://x.com/i/status/123', seen[1])
+        self.assertNotIn(second_ref, seen[1])
+        self.assertNotIn('https://x.com/i/status/124', seen[1])
+        self.assertIn(first_ref, sources_path.read_text())
+        self.assertIn(second_ref, sources_path.read_text())
+        self.assertIn('https://x.com/i/status/124', sources_path.read_text())
+        self.assertIn('[Sources already learned from](sources.md)',
+                      (sources_path.parent / 'SKILL.md').read_text())
+
+    def test_sources_written_after_runner_failure_timeout_or_skip(self):
+        self.triage['wiki'] = False
+        self.bot['relevance'] = 'high'
+        sources_path = self.profile / 'skills/bookmarks/useful-topic/sources.md'
+        for item_id, outcome in [('123', 'failure'), ('124', 'timeout'), ('125', 'skip')]:
+            with self.subTest(outcome=outcome):
+                self.bundle = {'source_id': 'x:' + item_id}
+                seen = []
+
+                def runner(argv, **kwargs):
+                    seen.append(sources_path.read_text() if sources_path.exists() else '')
+                    if outcome == 'timeout':
+                        raise subprocess.TimeoutExpired(argv, kwargs['timeout'])
+                    raise OSError('runner unavailable')
+
+                result = self.run_delivery(runner, bot_runs=outcome != 'skip')
+                reference = Path(result['bots'][0]['reference_path']).name
+                if outcome == 'skip':
+                    self.assertIsNone(result['bots'][0]['bot_run'])
+                    self.assertEqual(seen, [])
+                else:
+                    self.assertNotIn(reference, seen[0])
+                    self.assertNotIn('https://x.com/i/status/' + item_id, seen[0])
+                    error = result['bots'][0]['bot_run']['error']
+                    self.assertIn('timed out' if outcome == 'timeout' else 'runner unavailable', error)
+                self.assertIn(reference, sources_path.read_text())
+                self.assertIn('https://x.com/i/status/' + item_id, sources_path.read_text())
+
     def test_partial_links_sources_regeneration_and_bot_prompt(self):
         first = self.run_delivery()
         old_wiki = first['wiki']['path']

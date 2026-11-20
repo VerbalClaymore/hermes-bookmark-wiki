@@ -7,8 +7,10 @@ from email.utils import parsedate_to_datetime
 from pathlib import Path
 import re
 import shutil
+import sqlite3
 import subprocess
 import sys
+from types import SimpleNamespace
 
 
 from . import bird as bird_module, capture as capture_module, config as config_module
@@ -91,6 +93,17 @@ def _artifact(store, ident, stage, context):
     return obj
 
 
+def _preserve_delivery(state, ident):
+    path = state.artifact(ident, 'deliver')
+    previous = state.item_dir(ident) / 'delivery.previous.json'
+    if path.exists():
+        try:
+            delivery = state.read_artifact(ident, 'deliver')
+        except (OSError, ValueError):
+            return
+        store_module.atomic_json(previous, delivery)
+
+
 def _error(exc, stage):
     message = ' '.join(str(exc).split())[:400] or 'operation failed'
     if re.match(r'^[A-Z][A-Z_]+: ', message):
@@ -150,7 +163,10 @@ def sync(vault, *, limit=None, capture_count=None, capture=True, bot_runs=True, 
                     obj = state.read_artifact(row['tweet_id'], 'capture')
                     post = next((t for t in obj.get('tweets', []) if isinstance(t, dict)
                                  and str(t.get('id')) == row['tweet_id']), None)
-                    return _timestamp(post.get('createdAt')) if post else 0.0
+                    if post is not None:
+                        return _timestamp(post.get('createdAt'))
+                    dates = (_timestamp(t.get('createdAt')) for t in obj.get('tweets', []) if isinstance(t, dict))
+                    return min((timestamp for timestamp in dates if timestamp), default=0.0)
                 except (OSError, ValueError, TypeError):
                     return 0.0
             dated = [(row, post_date(row)) for row in rows]
@@ -178,6 +194,7 @@ def sync(vault, *, limit=None, capture_count=None, capture=True, bot_runs=True, 
                             obj = None
                         if obj is None:
                             index = store_module.STAGES.index(stage)
+                            _preserve_delivery(state, ident)
                             for later in store_module.STAGES[index:]:
                                 state.artifact(ident, later).unlink(missing_ok=True)
                             previous = store_module.STAGES[index - 1] if index else None
@@ -233,10 +250,15 @@ def sync(vault, *, limit=None, capture_count=None, capture=True, bot_runs=True, 
                                                      'wiki_path': (earlier_delivery.get('wiki') or {}).get('path'),
                                                      'references': {(b['profile'], b['topic_slug']): b['reference_path']
                                                                     for b in earlier_delivery.get('bots', [])}}
+                                    previous_path = state.item_dir(ident) / 'delivery.previous.json'
+                                    previous_delivery = json.loads(previous_path.read_text(encoding='utf-8')) if previous_path.exists() else None
                                     obj = deliver.deliver(state.item_dir(ident), ctx['resolve'], ctx['triage'], ctx['write'],
                                                           cfg, vault, bot_runner=d['bot_runner'], clock=d['clock'], bot_runs=bot_runs,
-                                                          builds_on=builds_on, sources=lambda profile, topic: ledger.topic_sources(state, profile, topic))
+                                                          builds_on=builds_on, sources=lambda profile, topic: ledger.topic_sources(state, profile, topic),
+                                                          previous=previous_delivery)
                             state.write_artifact(ident, stage, obj)
+                            if stage == 'deliver':
+                                (state.item_dir(ident) / 'delivery.previous.json').unlink(missing_ok=True)
                         ctx[stage] = obj
                         if stage == 'resolve':
                             ctx['prior'] = {'coverage': ledger.prior_coverage(state, obj), 'recent': ledger.recent_notes(state)}
@@ -386,6 +408,7 @@ def retry(vault, source_id, *, from_stage='capture'):
         with state.locked():
             row = _row(state, source_id)
             index = store_module.STAGES.index(from_stage)
+            _preserve_delivery(state, row['tweet_id'])
             for stage in store_module.STAGES[index:]:
                 state.artifact(row['tweet_id'], stage).unlink(missing_ok=True)
             previous = store_module.STAGES[index - 1] if index else None
@@ -394,5 +417,97 @@ def retry(vault, source_id, *, from_stage='capture'):
                 values.update(value=None, destinations_json=None)
             _update(state, source_id, **values)
             return {'source_id': source_id, 'from_stage': from_stage}
+    finally:
+        state.close()
+
+
+def prune_orphans(vault, *, apply=False):
+    """Find only superseded files with a current, existing same-destination file."""
+    vault = Path(vault).absolute()
+    cfg = config_module.load(vault)
+    home = Path(cfg['hermes']['home']).absolute()
+    state = store_module.Store(vault) if apply else None
+    def scan():
+        changes = []
+        items = deliver._safe_path(vault, 'lane', 'items')
+        if not items.is_dir():
+            return {'apply': apply, 'changes': changes}
+        for item in sorted(items.iterdir()):
+            if item.is_symlink() or not item.is_dir() or not re.fullmatch(r'[0-9]+', item.name):
+                continue
+            artifact = deliver._safe_path(item, 'delivery.json')
+            if not artifact.is_file():
+                continue
+            try:
+                current = state.read_artifact(item.name, 'deliver') if state else json.loads(artifact.read_text(encoding='utf-8'))
+                if not isinstance(current, dict) or not isinstance(current.get('bots'), list):
+                    continue
+                old = {'wiki': None, 'bots': []}
+                wiki_dir = deliver._safe_path(vault, 'wiki', 'topics')
+                wiki = (current.get('wiki') or {}).get('path')
+                if isinstance(wiki, str):
+                    target = Path(wiki)
+                    if (target.parent == wiki_dir and re.fullmatch(r'Bookmark_' + item.name + r'_[a-z0-9-]+\.md', target.name)
+                            and target.is_file() and target.resolve() == target.absolute()):
+                        for candidate in sorted(wiki_dir.glob('Bookmark_' + item.name + '_*.md')):
+                            if candidate != target and not candidate.is_symlink() and candidate.is_file():
+                                old['wiki'] = {'path': str(candidate)}
+                                changes.extend(deliver.cleanup_delivery(item, vault, home, item.name, old, current, apply=apply))
+                                old['wiki'] = None
+                valid_bots = []
+                for bot in current['bots']:
+                    if not isinstance(bot, dict):
+                        continue
+                    profile, topic = bot.get('profile'), bot.get('topic_slug')
+                    if not isinstance(profile, str) or not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9_-]*', profile):
+                        continue
+                    if not isinstance(topic, str) or not re.fullmatch(r'[a-z0-9-]{3,40}', topic):
+                        continue
+                    directory = deliver._safe_path(home, 'profiles', profile, 'skills', 'bookmarks', topic, 'references')
+                    value = bot.get('reference_path')
+                    if not isinstance(value, str):
+                        continue
+                    target = Path(value)
+                    if (target.parent != directory or not re.fullmatch(item.name + r'-[a-z0-9-]+\.md', target.name)
+                            or not target.is_file() or target.resolve() != target.absolute()):
+                        continue
+                    valid_bots.append((profile, topic, target))
+                if len(valid_bots) != len(current['bots']) or not valid_bots:
+                    continue
+                profiles = deliver._safe_path(home, 'profiles')
+                for directory in sorted(profiles.glob('*/skills/bookmarks/*/references')):
+                    if directory.resolve() != directory.absolute() or not directory.is_dir():
+                        continue
+                    profile, topic = directory.parents[3].name, directory.parent.name
+                    if not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9_-]*', profile) or not re.fullmatch(r'[a-z0-9-]{3,40}', topic):
+                        continue
+                    target = next((p for prof, top, p in valid_bots if (prof, top) == (profile, topic)), None)
+                    for candidate in sorted(directory.glob(item.name + '-*.md')):
+                        if (candidate != target and not candidate.is_symlink() and candidate.is_file()
+                                and re.fullmatch(item.name + r'-[a-z0-9-]+\.md', candidate.name)):
+                            old['bots'] = [{'profile': profile, 'topic_slug': topic, 'reference_path': str(candidate)}]
+                            changes.extend(deliver.cleanup_delivery(item, vault, home, item.name, old, current,
+                                           sources=topic_sources, apply=apply))
+                            old['bots'] = []
+            except (OSError, ValueError, TypeError, KeyError):
+                if apply:
+                    raise
+                continue
+        return {'apply': apply, 'changes': changes}
+    if state is None:
+        db_path = vault / 'lane' / 'lane.sqlite3'
+        connection = sqlite3.connect(db_path.as_uri() + '?mode=ro', uri=True) if db_path.is_file() else None
+        if connection:
+            connection.row_factory = sqlite3.Row
+        topic_sources = (lambda profile, topic: ledger.topic_sources(SimpleNamespace(db=connection), profile, topic)) if connection else None
+        try:
+            return scan()
+        finally:
+            if connection:
+                connection.close()
+    try:
+        with state.locked():
+            topic_sources = lambda profile, topic: ledger.topic_sources(state, profile, topic)
+            return scan()
     finally:
         state.close()

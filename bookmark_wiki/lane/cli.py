@@ -5,7 +5,7 @@ from . import pipeline, unbookmark
 def register(subparsers):
     lane = subparsers.add_parser('lane')
     actions = lane.add_subparsers(dest='lane_action', required=True)
-    for action in ('init', 'sync', 'seed', 'status', 'show', 'retry'):
+    for action in ('init', 'sync', 'seed', 'status', 'show', 'retry', 'prune-orphans'):
         command = actions.add_parser(action)
         command.add_argument('--vault', required=True)
         if action == 'sync':
@@ -26,6 +26,8 @@ def register(subparsers):
             command.add_argument('--id', required=True)
         if action == 'retry':
             command.add_argument('--from-stage', choices=('capture', 'resolve', 'triage', 'write', 'deliver'), default='capture')
+        if action == 'prune-orphans':
+            command.add_argument('--apply', action='store_true')
     unbookmark.register(actions)
 
 
@@ -46,4 +48,6 @@ def dispatch(args):
         return pipeline.status(args.vault)
     if args.lane_action == 'show':
         return pipeline.show(args.vault, args.id)
+    if args.lane_action == 'prune-orphans':
+        return pipeline.prune_orphans(args.vault, apply=args.apply)
     return pipeline.retry(args.vault, args.id, from_stage=args.from_stage)

@@ -317,7 +317,15 @@ Commands (all take `--vault`, print one JSON envelope like the existing CLI:
 - `lane status`: counts by status and stage, last sync time, failed items with errors.
 - `lane show --id x:<id>`: all artifacts of one item.
 - `lane retry --id x:<id> [--from-stage capture|resolve|triage|write|deliver]`:
-  delete artifacts from that stage on and reset attempts.
+  delete artifacts from that stage on and reset attempts. The item is processed by
+  the next sync. The previous delivery record is kept as `delivery.previous.json`
+  until redelivery succeeds, so superseded files can be removed (see 5.3).
+- `lane prune-orphans [--apply]`: find wiki notes and bot references for an item that
+  are not the files its current delivery record names; dry run by default, `--apply`
+  backs them up, removes them and their index/`SKILL.md` lines, and redirects links.
+- `--newer-than YYYY-MM-DD` on sync dates an item by its own post, or, when that post
+  is not in the capture (a bookmarked reply filed under its root), by the earliest
+  captured tweet.
 
 After each sync write/append `lane/reports/<UTC date>.md`: one block per item with
 title, value, where the content was found, destinations (wiki path, bots with topic,
@@ -515,7 +523,12 @@ The full existing suite must still pass (179 run, 12 skips before this work).
 - Each bot topic skill gets `sources.md`, regenerated at delivery from the ledger:
   every source this bot topic has learned from (key or URL, date, takeaway, reference
   file). The bot run prompt tells the bot to consult it and not to re-add lessons it
-  already has. `SKILL.md` links `sources.md` once.
+  already has. The bot runs before the current item is added, so it never sees the
+  item it is judging as already absorbed; `sources.md` is written after the run in
+  every outcome. `SKILL.md` links `sources.md` once.
+- Redelivery with a changed title slug removes the item's superseded wiki note, index
+  line, bot references and `SKILL.md` lines (backed up first), redirects Markdown links
+  to the new files, and refreshes `sources.md` for topics the item no longer goes to.
 
 ### 5.4 Removing synced bookmarks (the only X write)
 
